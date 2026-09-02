@@ -8,6 +8,7 @@ import {
   Receipt, Wallet, ArrowDownToLine, ArrowUpFromLine, ScrollText, Scale,
   ClipboardList, TrendingUp, Landmark, Plus, Trash2, Menu, X, Info,
   ChevronDown, Save, RotateCcw, FileDown, FileUp, BarChart3, RefreshCw, Search, FileText, LogOut,
+  Settings,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { doc, onSnapshot, setDoc } from "firebase/firestore";
@@ -1824,15 +1825,11 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
         </nav>
         <div className="sidebar-foot">
           <div className="save-indicator">{saveState === "saving" ? "Saving…" : "Saved to the cloud"}</div>
-          <div className="backup-hint">Full backup — everything: company, masters &amp; all 5 journals</div>
-          <div className="backup-row">
-            <button className="ghost-btn" onClick={handleExportBackup}><FileDown size={13} /> Export full backup</button>
-            <button className="ghost-btn" onClick={() => backupInputRef.current?.click()}><FileUp size={13} /> Import full backup</button>
-            <input ref={backupInputRef} type="file" accept=".json" style={{ display: "none" }} onChange={handleImportBackupFile} />
-          </div>
-          {backupMsg && <div className={"backup-msg" + (backupMsg.type === "error" ? " error" : "")}>{backupMsg.text}</div>}
-          <button className="ghost-btn" onClick={resetAll}><RotateCcw size={13} /> Reset workbook</button>
-          {onSignOut && <button className="ghost-btn" onClick={onSignOut}><LogOut size={13} /> Sign out</button>}
+          <button className={"nav-item settings-tab" + (page === "settings" ? " active" : "")}
+            onClick={() => { setPage("settings"); setNavOpen(false); }}>
+            <Settings size={16} strokeWidth={2} /><span>Settings</span>
+          </button>
+          <input ref={backupInputRef} type="file" accept=".json" style={{ display: "none" }} onChange={handleImportBackupFile} />
         </div>
       </div>
 
@@ -1873,11 +1870,64 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
           {page === "sawt" && <SAWTPage data={data} />}
           {page === "form2307" && <Form2307Page data={data} setData={setData} />}
           {page === "alphalist" && <AlphalistEmployeesPage data={data} setData={setData} />}
+          {page === "settings" && (
+            <SettingsPage
+              backupMsg={backupMsg}
+              onExportBackup={handleExportBackup}
+              onImportBackup={() => backupInputRef.current?.click()}
+              onResetWorkbook={resetAll}
+              onSignOut={onSignOut}
+            />
+          )}
         </div>
       </div>
       {confirmDialog && (
         <ConfirmModal title={confirmDialog.title} message={confirmDialog.message} confirmLabel={confirmDialog.confirmLabel} danger={confirmDialog.danger}
           onCancel={() => setConfirmDialog(null)} onConfirm={confirmDialog.onConfirm} />
+      )}
+    </div>
+  );
+}
+
+/* ============================== SETTINGS ============================== */
+
+function SettingsPage({ backupMsg, onExportBackup, onImportBackup, onResetWorkbook, onSignOut }) {
+  return (
+    <div>
+      <SectionHeader icon={Settings} title="Settings" subtitle="Back up or restore this client's books, start over, or sign out." />
+
+      <div className="settings-section">
+        <div className="settings-section-head">
+          <h3>Full backup</h3>
+          <p>Everything for this client — company, masters &amp; all journals — as a single JSON file.</p>
+        </div>
+        <div className="settings-actions">
+          <button className="settings-btn" onClick={onExportBackup}><FileDown size={15} /> Export full backup</button>
+          <button className="settings-btn" onClick={onImportBackup}><FileUp size={15} /> Import full backup</button>
+        </div>
+        {backupMsg && <div className={"backup-msg" + (backupMsg.type === "error" ? " error" : "")}>{backupMsg.text}</div>}
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-section-head">
+          <h3>Danger zone</h3>
+          <p>Reset clears all data for this client and starts fresh. This cannot be undone.</p>
+        </div>
+        <div className="settings-actions">
+          <button className="settings-btn danger" onClick={onResetWorkbook}><RotateCcw size={15} /> Reset workbook</button>
+        </div>
+      </div>
+
+      {onSignOut && (
+        <div className="settings-section">
+          <div className="settings-section-head">
+            <h3>Account</h3>
+            <p>Sign out of Haki on this device.</p>
+          </div>
+          <div className="settings-actions">
+            <button className="settings-btn" onClick={onSignOut}><LogOut size={15} /> Sign out</button>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -6223,6 +6273,19 @@ function Style() {
       .backup-hint { font-size: 10.5px; color: #7FA3C7; margin-bottom: 6px; line-height: 1.4; }
       .ghost-btn { display: inline-flex; align-items: center; gap: 6px; background: none; border: 1px solid rgba(255,255,255,0.25); color: #DCEBFA; font-size: 11.5px; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
       .ghost-btn:hover { background: rgba(255,255,255,0.08); }
+      .settings-tab { margin-bottom: 0; }
+
+      /* Settings page */
+      .settings-section { border: 1px solid var(--line); border-radius: 10px; background: var(--white); padding: 18px 20px; margin-bottom: 16px; max-width: 640px; }
+      .settings-section-head h3 { font-family: 'Fraunces', serif; font-size: 15px; font-weight: 600; color: var(--green-deep); margin: 0 0 4px; }
+      .settings-section-head p { font-size: 12.5px; color: var(--ink-soft); margin: 0 0 14px; line-height: 1.5; }
+      .settings-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+      .settings-btn { display: inline-flex; align-items: center; gap: 7px; background: var(--white); border: 1px solid var(--line); color: var(--ink); font-size: 13px; font-weight: 500; padding: 9px 14px; border-radius: 7px; cursor: pointer; }
+      .settings-btn:hover { background: var(--paper-deep); border-color: var(--green); }
+      .settings-btn.danger { color: var(--red); border-color: #E7C9C9; }
+      .settings-btn.danger:hover { background: #FBECEC; border-color: var(--red); }
+      .content .backup-msg { margin-top: 12px; font-size: 12.5px; color: var(--green-deep); background: var(--paper-deep); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+      .content .backup-msg.error { color: var(--red); background: #FBECEC; border-color: #E7C9C9; }
 
       /* Client switcher (sidebar, above nav) */
       .client-switch-wrap { padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,0.14); display: flex; flex-direction: column; gap: 7px; }
