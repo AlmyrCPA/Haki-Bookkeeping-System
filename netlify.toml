@@ -1,0 +1,20 @@
+# Netlify build + SPA routing for the Haki (Vite + React) app.
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# Single-page app: every route falls back to index.html so client-side
+# rendering (and a hard refresh on any URL) works.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Firebase config is not secret, but if you want a preview/staging build to
+# point at a different Firebase project, set these in the Netlify UI instead of
+# committing them:
+#   VITE_FIREBASE_API_KEY, VITE_FIREBASE_AUTH_DOMAIN, VITE_FIREBASE_PROJECT_ID,
+#   VITE_FIREBASE_STORAGE_BUCKET, VITE_FIREBASE_MESSAGING_SENDER_ID, VITE_FIREBASE_APP_ID
