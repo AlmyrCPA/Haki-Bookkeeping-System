@@ -8,7 +8,7 @@ import {
   Receipt, Wallet, ArrowDownToLine, ArrowUpFromLine, ScrollText, Scale,
   ClipboardList, TrendingUp, Landmark, Plus, Trash2, Menu, X, Info,
   ChevronDown, Save, RotateCcw, FileDown, FileUp, BarChart3, RefreshCw, Search, FileText, LogOut,
-  Settings,
+  Settings, Check,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { doc, onSnapshot, setDoc } from "firebase/firestore";
@@ -186,11 +186,13 @@ function toMDY(str) {
 }
 
 export const emptyCompany = {
-  name: "", registeredName: "", address: "", tin: "", rdo: "", lineOfBusiness: "",
+  name: "", registeredName: "", address: "", zipCode: "", tin: "", rdo: "", lineOfBusiness: "",
   atp: "", dateRegistered: "", preparedBy: "", taxpayerType: "Non-Individual",
   surname: "", firstName: "", middleName: "",
   branchCode: "0000", addr1: "", addr2: "", tradeName: "",
   vatStatus: "VAT Registered",
+  // Payor's Authorized Representative — feeds the 2307 certificate's signature block.
+  authorizedSignatory: "", signatoryPosition: "", signatoryTin: "", signatureImage: "",
 };
 
 const NAV = [
@@ -1844,7 +1846,7 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
         </div>
         <div className="content">
           {page === "dashboard" && <Dashboard data={data} postings={postings} coaMap={coaMap} onLoadSample={loadSample} />}
-          {page === "company" && <CompanyPage data={data} setData={setData} />}
+          {page === "company" && <CompanyPage data={data} setData={setData} saveState={saveState} />}
           {page === "coa" && <CoaPage data={data} setData={setData} />}
           {page === "customers" && <CustomersPage data={data} setData={setData} />}
           {page === "suppliers" && <SuppliersPage data={data} setData={setData} />}
@@ -2068,18 +2070,54 @@ function Dashboard({ data, postings, coaMap, onLoadSample }) {
 
 /* ============================== COMPANY DETAILS ============================== */
 
-function CompanyPage({ data, setData }) {
-  const c = data.company;
-  const set = (k, v) => setData((d) => ({ ...d, company: { ...d.company, [k]: v } }));
+function CompanyPage({ data, setData, saveState }) {
+  // Company Details is the one page that does NOT autosave on every keystroke. Edits update a
+  // local draft; nothing is written to Firestore until "Save changes" is clicked, which commits
+  // the draft into `data` (the app's normal debounced Firestore save then picks it up).
+  const [draft, setDraft] = useState(data.company);
+  const savedJson = JSON.stringify(data.company);
+  // Follow the underlying company object if it changes out from under us — a client switch or a
+  // live update from another device — rather than stranding a stale draft.
+  useEffect(() => { setDraft(data.company); }, [savedJson]);
+  const c = draft;
+  const set = (k, v) => setDraft((p) => ({ ...p, [k]: v }));
   const isIndividual = c.taxpayerType === "Individual";
+  const dirty = JSON.stringify(draft) !== savedJson;
+
+  // Post-write confirmation: after committing, wait for the app's global save state to actually
+  // reach "saved" before showing "Saved" — not just optimistically on click.
+  const [savePhase, setSavePhase] = useState("idle"); // idle | pending | writing | done
+  useEffect(() => {
+    setSavePhase((p) => {
+      if (p === "pending" && saveState === "saving") return "writing";
+      if (p === "writing" && saveState === "saved") return "done";
+      return p;
+    });
+  }, [saveState]);
+  useEffect(() => {
+    if (savePhase !== "done") return;
+    const t = setTimeout(() => setSavePhase("idle"), 2500);
+    return () => clearTimeout(t);
+  }, [savePhase]);
+  // Fallback so the button never stays stuck on "Saving…" if the global save state
+  // transition is missed (e.g. an unchanged commit).
+  useEffect(() => {
+    if (savePhase !== "pending" && savePhase !== "writing") return;
+    const t = setTimeout(() => setSavePhase((p) => (p === "pending" || p === "writing") ? "done" : p), 4000);
+    return () => clearTimeout(t);
+  }, [savePhase]);
+  const handleSave = () => { setData((d) => ({ ...d, company: draft })); setSavePhase("pending"); };
+  const saving = savePhase === "pending" || savePhase === "writing";
+
   return (
     <div>
-      <SectionHeader icon={Building2} title="Company Details" subtitle="Single source of company info — every report and journal header pulls from here." />
+      <SectionHeader icon={Building2} title="Company Details" subtitle="Single source of company info — every report and journal header pulls from here. Changes here are saved only when you click Save changes." />
       <div className="form-card">
         <div className="form-grid">
           <LabeledField label="Business / Trade Name"><Field value={c.name} onChange={(v) => set("name", v)} placeholder="Your Company Name Inc." /></LabeledField>
           <LabeledField label="Registered Name"><Field value={c.registeredName} onChange={(v) => set("registeredName", v)} /></LabeledField>
           <LabeledField label="Registered Address" wide><Field value={c.address} onChange={(v) => set("address", v)} /></LabeledField>
+          <LabeledField label="Zip Code"><Field value={c.zipCode} onChange={(v) => set("zipCode", v)} placeholder="0000" /></LabeledField>
           <LabeledField label="TIN"><Field value={c.tin} onChange={(v) => set("tin", v)} placeholder="000-000-000-000" /></LabeledField>
           <LabeledField label="RDO Code"><Field value={c.rdo} onChange={(v) => set("rdo", v)} /></LabeledField>
           <LabeledField label="Line of Business"><Field value={c.lineOfBusiness} onChange={(v) => set("lineOfBusiness", v)} /></LabeledField>
@@ -2102,15 +2140,54 @@ function CompanyPage({ data, setData }) {
       </div>
 
       <div className="sub-block-title" style={{ marginTop: 28 }}>Tax Compliance Filing Details</div>
-      <p className="section-head-note">Used by the Tax Compliance tab (SLSPI, QAP, SAWT) when generating BIR .dat files — address is split into two lines since that's how the RELIEF/Alphalist format expects it.</p>
+      <p className="section-head-note">Used by the Tax Compliance tab (SLSPI, QAP, SAWT) when generating BIR .dat files — address is split into two lines since that's how the RELIEF/Alphalist format expects it. The Authorized Signatory block fills in the Payor's signature on generated BIR Form 2307 certificates.</p>
       <div className="form-card">
         <div className="form-grid">
           <LabeledField label="Branch Code"><Field value={c.branchCode} onChange={(v) => set("branchCode", v)} placeholder="0000" /></LabeledField>
           <LabeledField label="Trade Name (if different)"><Field value={c.tradeName} onChange={(v) => set("tradeName", v)} placeholder="Defaults to Business Name" /></LabeledField>
           <LabeledField label="Address Line 1" wide><Field value={c.addr1} onChange={(v) => set("addr1", v)} placeholder="Street / Barangay" /></LabeledField>
           <LabeledField label="Address Line 2" wide><Field value={c.addr2} onChange={(v) => set("addr2", v)} placeholder="City / Province" /></LabeledField>
+          <LabeledField label="Authorized Signatory"><Field value={c.authorizedSignatory} onChange={(v) => set("authorizedSignatory", v)} placeholder="Name of the person signing 2307s" /></LabeledField>
+          <LabeledField label="Position"><Field value={c.signatoryPosition} onChange={(v) => set("signatoryPosition", v)} placeholder="e.g. Finance Manager, President" /></LabeledField>
+          <LabeledField label="Signatory's TIN"><Field value={c.signatoryTin} onChange={(v) => set("signatoryTin", v)} placeholder="000-000-000 (the signatory's own TIN)" /></LabeledField>
+          <LabeledField label="E-Signature" wide>
+            <SignatureUploadField value={c.signatureImage} onChange={(v) => set("signatureImage", v)} />
+          </LabeledField>
         </div>
       </div>
+
+      <div className="company-save-bar">
+        {savePhase === "done" && <span className="save-confirm"><Check size={14} /> Saved</span>}
+        {dirty && savePhase === "idle" && <span className="save-pending-note">Unsaved changes</span>}
+        <button className="primary-btn" disabled={!dirty || saving} onClick={handleSave}>
+          {saving ? "Saving…" : "Save changes"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SignatureUploadField({ value, onChange }) {
+  const fileInputRef = useRef(null);
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => onChange(reader.result); // already a data: URL
+    reader.readAsDataURL(file);
+  };
+  return (
+    <div className="signature-upload">
+      {value ? (
+        <>
+          <img src={value} alt="Signature preview" style={{ maxHeight: 60, maxWidth: 200, border: "1px solid var(--line)", borderRadius: 6, background: "#fff", padding: 4 }} />
+          <button type="button" className="io-btn" onClick={() => onChange("")}>Remove</button>
+        </>
+      ) : (
+        <button type="button" className="io-btn" onClick={() => fileInputRef.current?.click()}><FileUp size={13} /> Upload signature image</button>
+      )}
+      <input ref={fileInputRef} type="file" accept="image/png,image/jpeg" style={{ display: "none" }} onChange={handleFileChange} />
     </div>
   );
 }
@@ -2183,6 +2260,7 @@ function SuppliersPage({ data, setData }) {
     { key: "middleName", label: "Middle Name", width: 120 },
     { key: "surname", label: "Surname", width: 120 },
     { key: "address", label: "Address", width: 200 },
+    { key: "zipCode", label: "Zip Code", width: 90 },
     { key: "itemCode", label: "Item Code", type: "combo", options: itemOptions, width: 160 },
     { key: "accountTitle", label: "Account Title", type: "combo", options: acctOptions, width: 220 },
     { key: "type", label: "Type", type: "select", options: PARTY_TYPES, width: 130 },
@@ -2957,6 +3035,8 @@ function PurchasesPage({ data, setData }) {
   }), { vatable: 0, nonvat: 0, inputVat: 0, total: 0, ewt: 0, net: 0 });
   const emptyMsg = data.purchases.length === 0 ? "No purchases logged yet — add your first row above." : "No purchases match this filter.";
   const exportHook = useJournalExport("purchases", data, filteredRows, coaByCode);
+  const gen2307 = useGenerate2307(data, "purchases");
+  const generate2307Selected = () => gen2307.generate(data.purchases.filter((r) => sel.selected.has(r.id)));
 
   return (
     <div>
@@ -2964,9 +3044,11 @@ function PurchasesPage({ data, setData }) {
         right={<div className="header-actions"><ImportExportBar journalKey="purchases" data={data} importHook={importHook} /><ExportBar exportHook={exportHook} /></div>} />
       <ImportStatus status={importHook.status} />
       <ExportStatus status={exportHook.status} />
+      <ExportStatus status={gen2307.status} />
       {sel.selected.size > 0 && (
         <SelectionBar count={sel.selected.size} onClear={sel.clear}>
           <button className="io-btn accent" onClick={() => setQuickFixOpen(true)}>Quick Fix</button>
+          <button className="io-btn" onClick={generate2307Selected} disabled={gen2307.status?.type === "pending"}><FileDown size={13} /> Generate 2307</button>
           <button className="io-btn danger" onClick={onDeleteSelected}><Trash2 size={13} /> Delete selected</button>
         </SelectionBar>
       )}
@@ -3093,6 +3175,8 @@ function DisbursementsPage({ data, setData }) {
   const totals = filteredRows.reduce((a, r) => ({ amount: a.amount + num(r.amount), ewt: a.ewt + num(r.ewt), net: a.net + num(r.net) }), { amount: 0, ewt: 0, net: 0 });
   const emptyMsg = data.disbursements.length === 0 ? "No disbursements logged yet — add your first row above." : "No disbursements match this filter.";
   const exportHook = useJournalExport("disbursements", data, filteredRows, coaByCode);
+  const gen2307 = useGenerate2307(data, "disbursements");
+  const generate2307Selected = () => gen2307.generate(data.disbursements.filter((r) => sel.selected.has(r.id)));
 
   return (
     <div>
@@ -3100,8 +3184,10 @@ function DisbursementsPage({ data, setData }) {
         right={<div className="header-actions"><ImportExportBar journalKey="disbursements" data={data} importHook={importHook} /><ExportBar exportHook={exportHook} /></div>} />
       <ImportStatus status={importHook.status} />
       <ExportStatus status={exportHook.status} />
+      <ExportStatus status={gen2307.status} />
       {sel.selected.size > 0 && (
         <SelectionBar count={sel.selected.size} onClear={sel.clear}>
+          <button className="io-btn" onClick={generate2307Selected} disabled={gen2307.status?.type === "pending"}><FileDown size={13} /> Generate 2307</button>
           <button className="io-btn danger" onClick={onDeleteSelected}><Trash2 size={13} /> Delete selected</button>
         </SelectionBar>
       )}
@@ -4218,6 +4304,13 @@ function buildFilingDetails(data, period) {
     tradeName: c.tradeName || displayName,
     addr1: c.addr1 || c.address || "",
     addr2: c.addr2 || "",
+    zipCode: c.zipCode || "",
+    preparedBy: c.preparedBy || "",
+    // Payor's Authorized Representative for the 2307 signature block.
+    authorizedSignatory: c.authorizedSignatory || "",
+    signatoryPosition: c.signatoryPosition || "",
+    signatoryTin: c.signatoryTin ? reliefFormatTIN(c.signatoryTin) : "",
+    signatureImage: c.signatureImage || "",
     month: period.month, year: period.year, quarter: period.quarter,
     sawtFormType: period.sawtFormType,
   };
@@ -5341,6 +5434,472 @@ async function downloadAll2316Zip(data, filingDetails, rows, year) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 
+/* ============================== BIR FORM 2307 GENERATION ============================== */
+// Certificate-drawing logic adapted from the verified 2307-generation.jsx reference. The layout
+// math and jsPDF calls are kept verbatim (verified against real BIR Form 2307 samples); only the
+// data plumbing is wired to this app's real Purchase Journal / Cash Disbursements rows, ATC
+// Reference, Suppliers Master and buildFilingDetails().
+
+const BIR_SEAL_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAHoAAABsCAMAAAHlD2bGAAAWfmNhQlgAABZ+anVtYgAAAB5qdW1kYzJwYQARABCAAACqADibcQNjMnBhAAAAFlhqdW1iAAAAR2p1bWRjMm1hABEAEIAAAKoAOJtxA3VybjpjMnBhOjZjMjYwY2E2LTE3ZjktNDQzMS1hMzExLTdjNGY1NTdiNGM2YwAAAAOTanVtYgAAAClqdW1kYzJhcwARABCAAACqADibcQNjMnBhLmFzc2VydGlvbnMAAAAAuGp1bWIAAABEanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5pbmdyZWRpZW50LnYzAAAAABhjMnNok2NcCf3gmrKkje+a8N23egAAAGxjYm9yo2lkYzpmb3JtYXRpaW1hZ2UvcG5namluc3RhbmNlSUR4LHhtcDppaWQ6OWZhZjYwZDAtN2VkNy00NGVlLTljMTctMjg3Mzk4M2QxZTAzbHJlbGF0aW9uc2hpcGhwYXJlbnRPZgAAAeJqdW1iAAAAQWp1bWRjYm9yABEAEIAAAKoAOJtxE2MycGEuYWN0aW9ucy52MgAAAAAYYzJzaO+yYOxOOZjhcSs+dFXwho4AAAGZY2JvcqJnYWN0aW9uc4KiZmFjdGlvbmtjMnBhLm9wZW5lZGpwYXJhbWV0ZXJzoWtpbmdyZWRpZW50c4GiY3VybHgtc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5pbmdyZWRpZW50LnYzZGhhc2hYIOKHDecwq45K+C1Au2pt5CKG0rvoURiWrdncp9BvwKW7pGZhY3Rpb254HWNvbS5hbnRocm9waWMuY2xhdWRlLnByb3ZpZGVkanBhcmFtZXRlcnOheB9jb20uYW50aHJvcGljLm9yaWdpbi1jb25maWRlbmNlZ3Vua25vd25rZGVzY3JpcHRpb254ZkNsYXVkZSBwcm92aWRlZCB0aGlzIGZpbGUgYXQgdGhlIHJlcXVlc3Qgb2YgYSB1c2VyIGFuZCBtYXkgaGF2ZSBjcmVhdGVkIG9yIG1vZGlmaWVkIHRoZSBmaWxlIGNvbnRlbnRzLm1zb2Z0d2FyZUFnZW50oWRuYW1lZkNsYXVkZXJhbGxBY3Rpb25zSW5jbHVkZWT1AAAAyGp1bWIAAABAanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5oYXNoLmRhdGEAAAAAGGMyc2gnkQspUl3SGqPx41NhHFN5AAAAgGNib3KlY2FsZ2ZzaGEyNTZjcGFkTQAAAAAAAAAAAAAAAABkaGFzaFgg4HAOMMylyn3L3J3P9tNQxo9DV/+iFjLea/CH6FDNHdxkbmFtZW5qdW1iZiBtYW5pZmVzdGpleGNsdXNpb25zgaJlc3RhcnQYIWZsZW5ndGgZFooAAAI+anVtYgAAACdqdW1kYzJjbAARABCAAACqADibcQNjMnBhLmNsYWltLnYyAAAAAg9jYm9ypWNhbGdmc2hhMjU2aXNpZ25hdHVyZXhNc2VsZiNqdW1iZj0vYzJwYS91cm46YzJwYTo2YzI2MGNhNi0xN2Y5LTQ0MzEtYTMxMS03YzRmNTU3YjRjNmMvYzJwYS5zaWduYXR1cmVqaW5zdGFuY2VJRHgseG1wOmlpZDpkMTk0N2Q1YS01MTNkLTQ3ZGYtYTM2ZC0zZjAzZTNlOWI4ODdyY3JlYXRlZF9hc3NlcnRpb25zg6JjdXJseC1zZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmluZ3JlZGllbnQudjNkaGFzaFgg4ocN5zCrjkr4LUC7am3kIobSu+hRGJat2dyn0G/ApbuiY3VybHgqc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5hY3Rpb25zLnYyZGhhc2hYIMUnKqreyfZgnA7yR6tBxFi3H9W42qqduxxAxtGAy0DKomN1cmx4KXNlbGYjanVtYmY9YzJwYS5hc3NlcnRpb25zL2MycGEuaGFzaC5kYXRhZGhhc2hYIJiratROHbjCNcZ4wmjOIMesnGAml6GKRa8SvxkZXW29dGNsYWltX2dlbmVyYXRvcl9pbmZvo2RuYW1lb0FudGhyb3BpYyBGaWxlc2d2ZXJzaW9uZTEuMC4wa3NwZWNWZXJzaW9uZTIuNC4wAAAQOGp1bWIAAAAoanVtZGMyY3MAEQAQgAAAqgA4m3EDYzJwYS5zaWduYXR1cmUAAAAQCGNib3LShFkCEqIBJhghWQIKMIICBjCCAY2gAwIBAgIUQOWgCu7COdC+uIP6BkIFPWdVEwAwCgYIKoZIzj0EAwMwSTEXMBUGA1UEChMOQW50aHJvcGljLCBQQkMxLjAsBgNVBAMTJUFudGhyb3BpYyBDb250ZW50IENyZWRlbnRpYWxzIFJvb3QgQ0EwHhcNMjYwODA3MTg0MzU2WhcNMjgwODA2MTk0MzU2WjBEMRcwFQYDVQQKEw5BbnRocm9waWMsIFBCQzEpMCcGA1UEAxMgQW50aHJvcGljIENsYXVkZSBDb250ZW50IFNpZ25pbmcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASYegpry1AYBRTVNL1CpTlbROnY3dey+UrsF9C3phYrATN3ZHf93Mo8RQN0KOUuOn19P4oWNFWe5n2/She9N7eTo1gwVjAOBgNVHQ8BAf8EBAMCB4AwFQYDVR0lBA4wDAYKKwYBBAGD6F4CATAMBgNVHRMBAf8EAjAAMB8GA1UdIwQYMBaAFM5R4gSBTmRbI/jjxM+aPpzB11zCMAoGCCqGSM49BAMDA2cAMGQCMDFzHRSeAXrSy1WOzkbhPZ6Km2wGTmZ/2gK18k8BQGXyqz88Rdrz6CTX9flAnYNVxgIwcF9c3fVhqmJKpi+UhasNUMko69cyX6STPfta3Q8EjyzDjzoyrol46FP6VFHhvUcJoWNwYWRZDZ4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2WEB21xAK0IFkaJiTVQevCn0jTgIrjuVLb6UYc+a5bfJDoBeF7Ww07Z6gnLPYb6tzfqPSGGzM05e3STROhDABGWAGY/GOlwAAAAFzUkdCAK7OHOkAAAAEZ0FNQQAAsY8L/GEFAAACr1BMVEX////7+/vZ2dmysrJdXV08PDwwMDAzMzMxMTE1NTV0dHS/v7/t7e35+fmnp6c2NjYqKiomJiYkJCQlJSUnJycoKChLS0vo6Oj6+vqjo6MvLy8jIyMiIiIrKyuSkpL39/dpaWn8/Pzu7u4hISE5OTnm5uY4ODhKSko3NzcpKSna2trW1tYsLCzU1NT9/f3GxsZ8fHzc3NxAQEAtLS1ubm7r6+vY2NilpaWioqLV1dU7Oztqamrv7+/BwcFaWlpXV1f4+Pjx8fFxcXE9PT1ERERZWVmbm5s/Pz9BQUFTU1NkZGTd3d3n5+dcXFxQUFC4uLi5ublNTU2urq7+/v6IiIjw8PCwsLAuLi7j4+PJycljY2NgYGAgICC+vr56enpbW1v19fW3t7dra2ucnJxhYWE+Pj7R0dFFRUVtbW2ZmZlsbGw6Ojp7e3vs7Ozk5OROTk5+fn6pqanMzMxzc3Py8vLCwsJVVVWdnZ2rq6uOjo6vr6+Wlpbh4eFYWFj29vaDg4OHh4eFhYVwcHC0tLRWVlYyMjLFxcW7u7uYmJh1dXV4eHjAwMDS0tJRUVFiYmKQkJB9fX3Ozs5SUlKTk5NeXl6CgoKLi4vLy8uamprHx8eJiYnDw8PX19fT09Pz8/OEhIRCQkKtra1HR0eUlJTPz8+zs7O2trZmZmb09PQfHx92dnafn580NDSAgIBISEhvb29MTEx/f39ycnLf39/ExMRnZ2doaGh3d3dDQ0Oenp7l5eW8vLx5eXlfX1/p6emmpqZGRkZPT08dHR2srKzNzc2oqKiVlZWGhoZlZWWBgYGXl5dJSUnq6upUVFSkpKS1tbWKiore3t6goKDb29uPj4+MjIzi4uIeHh66urrg4ODIyMi9vb3KysqRkZHQ0NCNjY2hoaGqqqocHByxsbEAAAD7FYZkAAAA5XRSTlP///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8A/6eJEAAAAAlwSFlzAAAh1QAAIdUBBJy0nQAADc5JREFUWEftmcuVIyuzhZnhBCNsYcYUJ3LKABfSFEzAHtKS++0gUyVVlVSqPo+1/rvO7i4pk1cEQTyRexfBuXE+CiG4GnuidSG4npxL3R1ng4u95ND5Xq/BlZDDEVKLa1JoIZQjjJ2H1cCiR1CzvQohHSmE5Nr17tzkPelhgcHR3b0D+u9f/wDd+fMJaK3usv9Yk22z0fO9BA8TIYy53qP3g32kurYZXYzHUcK+w6WQ2EA4Nvi+Fkydln5bviSkwo6vhlC6qw4xnO/gbvRfgdg+Hz+Dc3CDTh0gzJ2tF4x5mjdOfXe5fpZ345R8LN75HflsdN+0QgjZRdq2cLCI5u5BtC7osaXgD5iQRsxexOrqBJCurAhX/Ui+SGOMpRv0mvpwO1tA4XwrNy1cCOjTOIJvCDo1aM+72SCFCI3e8iwpowuMPHsuQNX43Gqu96Qf4F8I+J+GtOw5betCiN9gmZ/++qPSGQLajm3UiUhxB5/7ZQsocPUOnWbAY79MKHSfOBgGycQeuqVSHlGn0JvneFzMZ4/B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";
+const BIR_BARCODE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAPAAAAA2CAIAAAB2hoNsAAAWfmNhQlgAABZ+anVtYgAAAB5qdW1kYzJwYQARABCAAACqADibcQNjMnBhAAAAFlhqdW1iAAAAR2p1bWRjMm1hABEAEIAAAKoAOJtxA3VybjpjMnBhOjkzNjA0MTFhLTA0MjMtNGQ3Ni1iOGNiLTUyYjJhNTIzYzQyYwAAAAOTanVtYgAAAClqdW1kYzJhcwARABCAAACqADibcQNjMnBhLmFzc2VydGlvbnMAAAAAuGp1bWIAAABEanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5pbmdyZWRpZW50LnYzAAAAABhjMnNoSSwi4korTdeBZKvPZXuFzgAAAGxjYm9yo2lkYzpmb3JtYXRpaW1hZ2UvcG5namluc3RhbmNlSUR4LHhtcDppaWQ6ZTA5MTE0NzUtZTQwOC00MGQwLWIxYzEtODJjNWUwNWNjZDI3bHJlbGF0aW9uc2hpcGhwYXJlbnRPZgAAAeJqdW1iAAAAQWp1bWRjYm9yABEAEIAAAKoAOJtxE2MycGEuYWN0aW9ucy52MgAAAAAYYzJzaOin5qV+tBKU9u3ceCof/48AAAGZY2JvcqJnYWN0aW9uc4KiZmFjdGlvbmtjMnBhLm9wZW5lZGpwYXJhbWV0ZXJzoWtpbmdyZWRpZW50c4GiY3VybHgtc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5pbmdyZWRpZW50LnYzZGhhc2hYIBsXv9bqPVeTxi0rMoi/GWp6HocrJqj8AXG92jtMd5S9pGZhY3Rpb254HWNvbS5hbnRocm9waWMuY2xhdWRlLnByb3ZpZGVkanBhcmFtZXRlcnOheB9jb20uYW50aHJvcGljLm9yaWdpbi1jb25maWRlbmNlZ3Vua25vd25rZGVzY3JpcHRpb254ZkNsYXVkZSBwcm92aWRlZCB0aGlzIGZpbGUgYXQgdGhlIHJlcXVlc3Qgb2YgYSB1c2VyIGFuZCBtYXkgaGF2ZSBjcmVhdGVkIG9yIG1vZGlmaWVkIHRoZSBmaWxlIGNvbnRlbnRzLm1zb2Z0d2FyZUFnZW50oWRuYW1lZkNsYXVkZXJhbGxBY3Rpb25zSW5jbHVkZWT1AAAAyGp1bWIAAABAanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5oYXNoLmRhdGEAAAAAGGMyc2hrzFSrQ3X/lSsaRTb9lFBLAAAAgGNib3KlY2FsZ2ZzaGEyNTZjcGFkTQAAAAAAAAAAAAAAAABkaGFzaFggDySalt9DYCpok6YHclj+8015CTD/cCSU5Q9wZbMr4pNkbmFtZW5qdW1iZiBtYW5pZmVzdGpleGNsdXNpb25zgaJlc3RhcnQYIWZsZW5ndGgZFooAAAI+anVtYgAAACdqdW1kYzJjbAARABCAAACqADibcQNjMnBhLmNsYWltLnYyAAAAAg9jYm9ypWNhbGdmc2hhMjU2aXNpZ25hdHVyZXhNc2VsZiNqdW1iZj0vYzJwYS91cm46YzJwYTo5MzYwNDExYS0wNDIzLTRkNzYtYjhjYi01MmIyYTUyM2M0MmMvYzJwYS5zaWduYXR1cmVqaW5zdGFuY2VJRHgseG1wOmlpZDo4YWUzNzkzNi04YzU4LTRkODYtODVmNy00ZWZhNTVjYjEyNDJyY3JlYXRlZF9hc3NlcnRpb25zg6JjdXJseC1zZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmluZ3JlZGllbnQudjNkaGFzaFggGxe/1uo9V5PGLSsyiL8ZanoehysmqPwBcb3aO0x3lL2iY3VybHgqc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5hY3Rpb25zLnYyZGhhc2hYIG7IAVipamG5O8bO/SJ+4J5rObFd9GQjI7najzlSVE8BomN1cmx4KXNlbGYjanVtYmY9YzJwYS5hc3NlcnRpb25zL2MycGEuaGFzaC5kYXRhZGhhc2hYILerdPRK4rO22wMXZFfigfwPfXridSkTHXTGWO9TUB1wdGNsYWltX2dlbmVyYXRvcl9pbmZvo2RuYW1lb0FudGhyb3BpYyBGaWxlc2d2ZXJzaW9uZTEuMC4wa3NwZWNWZXJzaW9uZTIuNC4wAAAQOGp1bWIAAAAoanVtZGMyY3MAEQAQgAAAqgA4m3EDYzJwYS5zaWduYXR1cmUAAAAQCGNib3LShFkCEqIBJhghWQIKMIICBjCCAY2gAwIBAgIUQOWgCu7COdC+uIP6BkIFPWdVEwAwCgYIKoZIzj0EAwMwSTEXMBUGA1UEChMOQW50aHJvcGljLCBQQkMxLjAsBgNVBAMTJUFudGhyb3BpYyBDb250ZW50IENyZWRlbnRpYWxzIFJvb3QgQ0EwHhcNMjYwODA3MTg0MzU2WhcNMjgwODA2MTk0MzU2WjBEMRcwFQYDVQQKEw5BbnRocm9waWMsIFBCQzEpMCcGA1UEAxMgQW50aHJvcGljIENsYXVkZSBDb250ZW50IFNpZ25pbmcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASYegpry1AYBRTVNL1CpTlbROnY3dey+UrsF9C3phYrATN3ZHf93Mo8RQN0KOUuOn19P4oWNFWe5n2/She9N7eTo1gwVjAOBgNVHQ8BAf8EBAMCB4AwFQYDVR0lBA4wDAYKKwYBBAGD6F4CATAMBgNVHRMBAf8EAjAAMB8GA1UdIwQYMBaAFM5R4gSBTmRbI/jjxM+aPpzB11zCMAoGCCqGSM49BAMDA2cAMGQCMDFzHRSeAXrSy1WOzkbhPZ6Km2wGTmZ/2gK18k8BQGXyqz88Rdrz6CTX9flAnYNVxgIwcF9c3fVhqmJKpi+UhasNUMko69cyX6STPfta3Q8EjyzDjzoyrol46FP6VFHhvUcJoWNwYWRZDZ4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2WECCGEDNCCDT4qqYWt3637HoFYrvmlG0zgKj+hBhlWjITe65An20EeApczhiWmKCZ7jzYb6BLcOEy3+qUj/J0AY5+JIChQAAAAFzUkdCAK7OHOkAAAAEZ0FNQQAAsY8L/GEFAAAACXBIWXMAAA7DAAAOwwHHb6hkAAACDUlEQVR4Xu3YwaojQQxD0WT+/58zMwgagbBxeG8l7lmETrXLroXoRb1fX/p8Pv9+3+//G/dnp/V06Zayv3j93nmSHdLeZzqDy73Trnx2ucvtb8Vr0n6Sy17ZK11OcdNJRCt/9AfoQKBRhUCjCoFGFQKNKgQaVQg0qhBoVLneeD/yWnu/7hatp3sHubxNXp+z3L4u0xTnfaZn5/1lmjJVXtanlZ3qfW8+O+8vlymS/d10BtEKX2hUIdCoQqBRhUCjCoFGFQKNKgQaVQg0qlxvvB95rb1fd8u9Xispe6bsLLk3397nTp1zer6d7FPkJ51zl/j69Jymid/Wp336fkKt8IVGFQKNKgQaVQg0qhBoVCHQqEKgUYVAo8r1xvuR19r7dbfs9ck7XGpkmi7eZ9orOX1a8V2yd5ap5jIlaya5102dp7nut86Q8gwuz5Yn4QuNKgQaVQg0qhBoVCHQqEKgUYVAowqBRpXrjfcjr7X3627Ruky7XHZwlyniNdPEqc90htw71Xul88rpJNO63Ceq5if1U4342+wv2WGS012eKk/CFxpVCDSqEGhUIdCoQqBRhUCjCoFGFQKNKtcb70dea+/X3aL1ydQn5VufldMvfbx+4pX7rpw47fLK7HafKNnNV9Jek3O/7aYV2fe6nOvyPDmFLzSqEGhUIdCoQqBRhUCjCoFGFQKNKgQaRV6vvyaB+HZYZ+5KAAAAAElFTkSuQmCC";
+
+const fmtCert = (n) => Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const QUARTER_2307_BOUNDS = {
+  1: { fromMonth: "01", fromDay: "01", toMonth: "03", toDay: "31" },
+  2: { fromMonth: "04", fromDay: "01", toMonth: "06", toDay: "30" },
+  3: { fromMonth: "07", fromDay: "01", toMonth: "09", toDay: "30" },
+  4: { fromMonth: "10", fromDay: "01", toMonth: "12", toDay: "31" },
+};
+
+// Flattens a Purchase Journal or Cash Disbursements row into the common shape the 2307 grouping
+// needs. Income payment = the EWT tax base: (VATable + Non-VAT) for purchases, the full amount
+// for disbursements — matching how computePurchaseRow / computeDisbRow derive `ewt`.
+function normalize2307Row(row, journalKey) {
+  const isPurch = journalKey === "purchases";
+  return {
+    name: (isPurch ? row.supplier : row.vendor) || "",
+    tin: row.tin || "",
+    address: row.address || "",
+    date: row.date,
+    atc: row.atc || "",
+    atcRate: num(row.atcRate),
+    ewt: num(row.ewt),
+    incomePayment: isPurch ? num(row.vatable) + num(row.nonvat) : num(row.amount),
+  };
+}
+
+// Groups the selected journal rows into one certificate payload per supplier: filter to rows
+// with an ATC and EWT > 0, require a single quarter, group by supplier (normalized TIN + name),
+// sub-group by ATC, bucket amounts into month-of-quarter columns, sum EWT. Returns
+// { groups, quarterInfo } or { error }.
+function build2307SupplierGroups(selectedRows, journalKey, data) {
+  const norm = selectedRows.map((r) => normalize2307Row(r, journalKey));
+  const qualifying = norm.filter((r) => r.atc && r.ewt > 0);
+  if (qualifying.length === 0) {
+    return { error: "None of the selected rows have both an ATC and withholding tax (EWT > 0) — nothing to certify." };
+  }
+
+  const quarters = new Set();
+  for (const r of qualifying) {
+    const d = parseAppDate(r.date);
+    if (!d) return { error: "One or more selected rows has an unrecognized date — fix it before generating." };
+    quarters.add(`${d.getFullYear()}-Q${Math.floor(d.getMonth() / 3) + 1}`);
+  }
+  if (quarters.size > 1) {
+    return { error: `The selected rows span ${quarters.size} quarters (${[...quarters].sort().join(", ")}). Narrow the selection to a single quarter and try again.` };
+  }
+
+  const qKey = [...quarters][0];
+  const year = Number(qKey.slice(0, 4));
+  const quarter = Number(qKey.slice(-1));
+  const qStartMonth = (quarter - 1) * 3; // 0-indexed first month of the quarter
+
+  const atcByCode = Object.fromEntries((data.atc || []).map((a) => [a.code, a]));
+  const suppliers = data.suppliers || [];
+
+  const bySupplier = new Map();
+  for (const r of qualifying) {
+    const key = `${normalizeTin(r.tin)}|${r.name.trim().toLowerCase()}`;
+    if (!bySupplier.has(key)) bySupplier.set(key, []);
+    bySupplier.get(key).push(r);
+  }
+
+  const groups = [];
+  for (const rows of bySupplier.values()) {
+    const first = rows[0];
+    const firstTin = normalizeTin(first.tin);
+    const sup =
+      (firstTin && suppliers.find((s) => normalizeTin(s.tin) === firstTin)) ||
+      suppliers.find((s) => (s.name || "").trim().toLowerCase() === first.name.trim().toLowerCase());
+    const payeeName = sup
+      ? (sup.type === "Individual"
+          ? [sup.surname, sup.firstName, sup.middleName].filter(Boolean).join(", ")
+          : (sup.registeredName || sup.name || first.name))
+      : first.name;
+
+    const byAtc = new Map();
+    for (const r of rows) {
+      if (!byAtc.has(r.atc)) byAtc.set(r.atc, []);
+      byAtc.get(r.atc).push(r);
+    }
+    const ewtLines = [];
+    for (const [atc, arows] of byAtc) {
+      const months = [0, 0, 0];
+      let taxWithheld = 0;
+      for (const r of arows) {
+        const d = parseAppDate(r.date);
+        const idx = d.getMonth() - qStartMonth;
+        if (idx >= 0 && idx <= 2) months[idx] += r.incomePayment;
+        taxWithheld += r.ewt;
+      }
+      ewtLines.push({
+        natureLabel: (atcByCode[atc] && atcByCode[atc].desc) || atc,
+        atc,
+        m1: round2(months[0]), m2: round2(months[1]), m3: round2(months[2]),
+        taxWithheld: round2(taxWithheld),
+      });
+    }
+    ewtLines.sort((a, b) => a.atc.localeCompare(b.atc));
+
+    groups.push({
+      payeeName: (payeeName || "").trim() || "(unnamed supplier)",
+      payeeTin: firstTin,
+      payeeAddress: (sup && sup.address) || first.address || "",
+      payeeZip: (sup && sup.zipCode) || "",
+      payeePosition: null, // Haki doesn't collect an individual payee signatory's name/position
+      ewtLines,
+    });
+  }
+  groups.sort((a, b) => a.payeeName.localeCompare(b.payeeName));
+
+  const b = QUARTER_2307_BOUNDS[quarter];
+  const quarterInfo = {
+    fromMonth: b.fromMonth, fromDay: b.fromDay, fromYear: String(year),
+    toMonth: b.toMonth, toDay: b.toDay, toYear: String(year),
+    quarter, year,
+  };
+  return { groups, quarterInfo };
+}
+
+async function build2307Pdf(jsPDFCtor, filingDetails, supplierGroup, quarterInfo) {
+  const doc = new jsPDFCtor({ orientation: "portrait", unit: "pt", format: "a4" });
+  const left = 34, right = 561;
+  let y = 30;
+  // One consistent gray value used for every shaded section in the form (Part I/II headers,
+  // both Part III table headers, CONFORME, and both signature blocks) — a prior draft had three
+  // different values (235, 224, and white/255) scattered across these, which is what "equal
+  // shading across the whole form" is fixing.
+  const GRAY = [222, 222, 222];
+
+  // ---- Header ----
+  doc.setDrawColor(0); doc.setLineWidth(0.75);
+  doc.rect(left, y, 90, 34);
+  doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
+  doc.text("For BIR", left + 4, y + 10);
+  doc.text("Use Only", left + 4, y + 17);
+  doc.text("BCS/", left + 4, y + 26);
+  doc.text("Item:", left + 4, y + 33);
+
+  doc.addImage(`data:image/png;base64,${BIR_SEAL_BASE64}`, "PNG", 275, y - 2, 45, 40);
+
+  doc.setFontSize(8); doc.setFont("helvetica", "bold");
+  doc.text("Republic of the Philippines", 297.5, y + 44, { align: "center" });
+  doc.text("Department of Finance", 297.5, y + 53, { align: "center" });
+  doc.text("Bureau of Internal Revenue", 297.5, y + 62, { align: "center" });
+
+  const formBoxX = left, formBoxY = y + 34;
+  doc.rect(formBoxX, formBoxY, 90, 40);
+  doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
+  doc.text("BIR Form No.", formBoxX + 4, formBoxY + 8);
+  doc.setFontSize(15); doc.setFont("helvetica", "bold");
+  doc.text("2307", formBoxX + 4, formBoxY + 24);
+  doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
+  doc.text("January 2018 (ENCS)", formBoxX + 4, formBoxY + 34);
+
+  doc.setFontSize(15); doc.setFont("helvetica", "bold");
+  doc.text("Certificate of Creditable", 297.5, y + 76, { align: "center" });
+  doc.text("Tax Withheld At Source", 297.5, y + 94, { align: "center" });
+
+  doc.addImage(`data:image/png;base64,${BIR_BARCODE_BASE64}`, "PNG", right - 100, y, 100, 22);
+  doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
+  doc.text("2307 01/18ENCS", right, y + 30, { align: "right" });
+
+  y = y + 94 + 12;
+  doc.setFontSize(7.5);
+  doc.text("Fill in all applicable spaces. Mark all appropriate boxes with an \u201cX\u201d.", left, y);
+  y += 10;
+
+  // ---- Field 1: Period ----
+  doc.rect(left, y, right - left, 16);
+  doc.setFontSize(7.5); doc.setFont("helvetica", "normal");
+  doc.text("1  For the Period", left + 3, y + 10);
+  doc.text("From", left + 90, y + 10);
+  const periodBoxes = (x0, vals) => {
+    let x = x0;
+    [vals.m, vals.d, vals.yr].forEach((v, i) => {
+      const w = i === 2 ? 30 : 18;
+      doc.rect(x, y + 2, w, 12);
+      doc.text(v, x + w / 2, y + 11, { align: "center" });
+      x += w + 2;
+    });
+  };
+  periodBoxes(left + 115, { m: quarterInfo.fromMonth, d: quarterInfo.fromDay, yr: quarterInfo.fromYear });
+  doc.text("(MM/DD/YYYY)", left + 200, y + 10);
+  doc.text("To", left + 260, y + 10);
+  periodBoxes(left + 278, { m: quarterInfo.toMonth, d: quarterInfo.toDay, yr: quarterInfo.toYear });
+  doc.text("(MM/DD/YYYY)", left + 363, y + 10);
+  y += 16;
+
+  const sectionBar = (label) => {
+    doc.setFillColor(...GRAY);
+    doc.rect(left, y, right - left, 12, "F");
+    doc.rect(left, y, right - left, 12);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(7.5);
+    doc.text(label, 297.5, y + 9, { align: "center" });
+    y += 12;
+  };
+  const tinRow = (num, label, tin) => {
+    doc.rect(left, y, right - left, 16);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(7.5);
+    doc.text(`${num}  ${label}`, left + 3, y + 10);
+    let x = left + 200;
+    [tin.slice(0, 3), tin.slice(3, 6), tin.slice(6, 9), "0000"].forEach((seg) => {
+      doc.rect(x, y + 2, 40, 12);
+      doc.text(seg, x + 20, y + 11, { align: "center" });
+      x += 42;
+    });
+    y += 16;
+  };
+
+  // ---- Part I - Payee Information ----
+  sectionBar("Part I - Payee   Information");
+  tinRow(2, "Taxpayer Identification Number (TIN)", supplierGroup.payeeTin.padEnd(9, "0"));
+
+  doc.rect(left, y, right - left, 20);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(7);
+  doc.text("3  Payee's Name (Last Name, First Name, Middle Name for Individual OR Registered Name for Non-Individual)", left + 3, y + 8);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8);
+  doc.text(supplierGroup.payeeName, left + 3, y + 17);
+  y += 20;
+
+  doc.rect(left, y, right - left, 16);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(7);
+  doc.text("4  Registered Address", left + 3, y + 6);
+  doc.text("4A  Zip Code", right - 85, y + 6);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(7.5);
+  doc.text(supplierGroup.payeeAddress || "", left + 3, y + 14);
+  doc.rect(right - 30, y + 2, 26, 11);
+  if (supplierGroup.payeeZip) doc.text(supplierGroup.payeeZip, right - 17, y + 11, { align: "center" });
+  y += 16;
+
+  doc.rect(left, y, right - left, 12);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(7);
+  doc.text("5  Foreign Address, if", left + 3, y + 9);
+  y += 12;
+
+  // ---- Part II - Payor Information ----
+  sectionBar("Part II - Payor   Information");
+  tinRow(6, "Taxpayer Identification Number (TIN)", filingDetails.companyTin.padEnd(9, "0"));
+
+  doc.rect(left, y, right - left, 20);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(7);
+  doc.text("7  Payor's Name (Last Name, First Name, Middle Name for Individual OR Registered Name for Non-Individual)", left + 3, y + 8);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8);
+  doc.text(filingDetails.displayName, left + 3, y + 17);
+  y += 20;
+
+  doc.rect(left, y, right - left, 16);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(7);
+  doc.text("8  Registered Address", left + 3, y + 6);
+  doc.text("8A  Zip Code", right - 85, y + 6);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(7.5);
+  doc.text(filingDetails.addr1 || "", left + 3, y + 14, { maxWidth: right - left - 90 });
+  doc.rect(right - 30, y + 2, 26, 11);
+  if (filingDetails.zipCode) doc.text(filingDetails.zipCode, right - 17, y + 11, { align: "center" });
+  y += 16;
+
+  // ---- Part III ----
+  sectionBar("Part III - Details of Monthly Income Payments and Tax Withheld for the Quarter");
+
+  const computedEwt = supplierGroup.ewtLines.map((r) => {
+    const total = Math.round((r.m1 + r.m2 + r.m3) * 100) / 100;
+    // Tax Withheld For the Quarter = the actual EWT already recorded on the journal rows for
+    // this ATC (summed upstream), not a re-derivation of total * rate.
+    return { ...r, total, taxWithheld: Math.round((r.taxWithheld || 0) * 100) / 100 };
+  });
+  const ewtTotal = computedEwt.reduce((s, r) => s + r.total, 0);
+  const ewtTaxTotal = computedEwt.reduce((s, r) => s + r.taxWithheld, 0);
+  const blankRowCount = Math.max(0, 8 - computedEwt.length); // pad to ~8 rows total, matching the verified template capacity
+
+  doc.autoTable({
+    startY: y,
+    margin: { left, right: 595.28 - right },
+    head: [
+      [{ content: "Income Payments Subject to Expanded\nWithholding Tax", rowSpan: 2 }, { content: "ATC", rowSpan: 2 },
+       { content: "AMOUNT OF INCOME PAYMENTS", colSpan: 4 }, { content: "Tax Withheld For the Quarter", rowSpan: 2 }],
+      ["1st Month of\nthe Quarter", "2nd Month of\nthe Quarter", "3rd Month of\nthe Quarter", "Total"],
+    ],
+    body: [
+      ...computedEwt.map((r) => [r.natureLabel, r.atc, fmtCert(r.m1), fmtCert(r.m2), fmtCert(r.m3), fmtCert(r.total), fmtCert(r.taxWithheld)]),
+      ...Array(blankRowCount).fill(["", "", "", "", "", "", ""]),
+      [{ content: "Total", styles: { fontStyle: "bold" } }, "", "", "", "", { content: fmtCert(ewtTotal), styles: { fontStyle: "bold" } }, { content: fmtCert(ewtTaxTotal), styles: { fontStyle: "bold" } }],
+    ],
+    styles: { font: "helvetica", fontSize: 6.5, cellPadding: 3, lineColor: [0, 0, 0], lineWidth: 0.5, valign: "middle" },
+    headStyles: { fillColor: GRAY, textColor: [0, 0, 0], fontStyle: "bold", halign: "center", fontSize: 6 },
+    columnStyles: { 0: { cellWidth: 180 }, 1: { cellWidth: 50, halign: "center" }, 2: { cellWidth: 55, halign: "right" }, 3: { cellWidth: 55, halign: "right" }, 4: { cellWidth: 55, halign: "right" }, 5: { cellWidth: 55, halign: "right" }, 6: { cellWidth: 77, halign: "right" } },
+  });
+  y = doc.lastAutoTable.finalY;
+
+  // ---- Table 2: Money Payments Subject to Withholding of Business Tax (re-added per request —
+  // always empty for now, since no current ATC/data distinguishes this category from standard EWT) ----
+  doc.autoTable({
+    startY: y,
+    margin: { left, right: 595.28 - right },
+    body: [
+      [{ content: "Money Payments Subject to Withholding\nof Business Tax (Government & Private)", styles: { fontStyle: "bold" } }, "", "", "", "", "", ""],
+      ...Array(6).fill(["", "", "", "", "", "", ""]),
+      [{ content: "Total", styles: { fontStyle: "bold" } }, "", "", "", "", { content: "-", styles: { fontStyle: "bold" } }, { content: "-", styles: { fontStyle: "bold" } }],
+    ],
+    styles: { font: "helvetica", fontSize: 6.5, cellPadding: 3, lineColor: [0, 0, 0], lineWidth: 0.5, valign: "middle" },
+    columnStyles: { 0: { cellWidth: 180 }, 1: { cellWidth: 50, halign: "center" }, 2: { cellWidth: 55, halign: "right" }, 3: { cellWidth: 55, halign: "right" }, 4: { cellWidth: 55, halign: "right" }, 5: { cellWidth: 55, halign: "right" }, 6: { cellWidth: 77, halign: "right" } },
+  });
+  y = doc.lastAutoTable.finalY + 8;
+
+  // ---- Declaration + signatures ----
+  // Bordered box, matching the real reference: a full-width rectangle with the declaration text
+  // inside, rather than free-floating text.
+  const declBoxTop = y;
+  doc.setFont("helvetica", "normal"); doc.setFontSize(6.5);
+  const declaration = "We declare, under the penalties of perjury, that this certificate has been made in good faith, verified by me, and to the best of my knowledge and belief, is true and correct, pursuant to the provisions of the National Internal Revenue Code, as amended, and the regulations issued under authority thereof. Further, we give our consent to the processing of our information as contemplated under the *Data Privacy Act of 2012 (R.A No. 10173) for legitimate and lawful purposes.";
+  doc.text(declaration, left + 4, y + 10, { maxWidth: right - left - 8 });
+  y += 26;
+  doc.rect(left, declBoxTop, right - left, y - declBoxTop);
+
+  // Signature block: ONE shaded, bordered box containing the signature (or blank space), the
+  // typed Name(Position/TIN) line, and the two static instructional lines together — matching
+  // the real reference's merged gray box, rather than free-floating text with underlines.
+  // Below that, a separate bordered row with vertical dividers for Tax Agent Accreditation /
+  // Date of Issuance / Date of Expiry — three real columns, not just label text with lines.
+  // nameLines: array of 1-2 strings to print above the two static instructional lines.
+  const signatureBlock = (nameLines, roleLine, signatureImageDataUrl) => {
+    const boxTop = y;
+    const sigAreaHeight = signatureImageDataUrl ? 30 : 16;
+    const nameLinesCount = nameLines.filter(Boolean).length;
+    const nameAreaHeight = nameLinesCount * 10;
+    const boxHeight = sigAreaHeight + nameAreaHeight + 2 + 8 + 6;
+
+    // Draw the shaded box first, then a white inset box specifically around the printed-name
+    // area (where a physical signature would go) — matching the real reference, which uses white
+    // there to visually set the signature line apart from the informational gray around it. Text
+    // is drawn once, last, on top of both shapes in the correct order.
+    doc.setFillColor(...GRAY);
+    doc.rect(left, boxTop, right - left, boxHeight, "FD");
+
+    const whiteBoxTop = boxTop + sigAreaHeight - 8;
+    const whiteBoxHeight = nameAreaHeight + 6;
+    doc.setFillColor(255, 255, 255);
+    doc.rect(297.5 - 110, whiteBoxTop, 220, whiteBoxHeight, "FD");
+
+    let ty = boxTop + sigAreaHeight;
+    if (signatureImageDataUrl) {
+      try { doc.addImage(signatureImageDataUrl, "PNG", 297.5 - 60, boxTop + 2, 120, 26); } catch (e) { /* text below still prints */ }
+    }
+    doc.setFont("helvetica", "bold"); doc.setFontSize(8);
+    nameLines.filter(Boolean).forEach((line) => { doc.text(line, 297.5, ty, { align: "center" }); ty += 10; });
+    ty += 2;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(6.5);
+    doc.text(roleLine, 297.5, ty, { align: "center" }); ty += 8;
+    doc.text("(Indicate Title/Designation and TIN)", 297.5, ty, { align: "center" }); // always static
+    y = boxTop + boxHeight;
+
+    // Tax Agent Accreditation row — bordered, three columns with vertical dividers.
+    const taHeight = 22;
+    const col1W = (right - left) * 0.46, col2W = (right - left) * 0.27;
+    doc.rect(left, y, right - left, taHeight);
+    doc.line(left + col1W, y, left + col1W, y + taHeight);
+    doc.line(left + col1W + col2W, y, left + col1W + col2W, y + taHeight);
+    doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
+    doc.text("Tax Agent Accreditation No./Attorney's Roll No. (if applicable)", left + col1W / 2, y + 9, { align: "center", maxWidth: col1W - 6 });
+    doc.text("Date of Issuance", left + col1W + col2W / 2, y + 9, { align: "center" });
+    doc.text("Date of Expiry", left + col1W + col2W + col2W / 2, y + 9, { align: "center" });
+    y += taHeight;
+  };
+
+  // Payor: one combined line "NAME (POSITION/TIN)" when signatory data is on file — matches the
+  // real reference exactly (e.g. "MARIA LINLEY S. SANTOS (PRESIDENT/450-103-423)"). Position and
+  // TIN share one parenthetical, separated by a slash — not separate elements as an earlier draft
+  // had it. Falls back to just the name if position/TIN haven't been entered yet.
+  const payorName = filingDetails.authorizedSignatory || filingDetails.preparedBy;
+  const payorLine = payorName && filingDetails.signatoryPosition && filingDetails.signatoryTin
+    ? `${payorName} (${filingDetails.signatoryPosition}/${filingDetails.signatoryTin})`
+    : payorName;
+  signatureBlock([payorLine], "Signature over Printed Name of Payor/Payor's  Authorized Representative/Tax Agent", filingDetails.signatureImage);
+
+  doc.setFillColor(...GRAY);
+  doc.rect(left, y, right - left, 12, "F");
+  doc.rect(left, y, right - left, 12);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(7.5);
+  doc.text("CONFORME:", 297.5, y + 9, { align: "center" });
+  y += 12;
+
+  // Payee: name on its own line, then "POSITION/TIN" on a second line below it when available —
+  // same parenthetical-free, slash-separated convention as the payor's line, just on its own row
+  // since the payee's name already sits on the line above. Haki doesn't currently collect an
+  // individual payee signatory's name/position (only the supplier entity's own name/TIN), so this
+  // second line only appears if that data is ever supplied — otherwise just the name prints.
+  // Always text, never an uploaded image, since Haki only stores this business's own signature.
+  const formatTinDashed = (t) => {
+    const digits = String(t ?? "").replace(/\D/g, "");
+    return digits.length >= 9 ? `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6, 9)}` : digits;
+  };
+  const payeePositionTinLine = supplierGroup.payeePosition && supplierGroup.payeeTin
+    ? `${supplierGroup.payeePosition} / ${formatTinDashed(supplierGroup.payeeTin)}`
+    : null;
+  signatureBlock([supplierGroup.payeeName, payeePositionTinLine], "Signature over Printed Name of Payee/Payee's Authorized Representative/Tax Agent", null);
+
+  doc.setFontSize(6);
+  doc.text("*NOTE: The BIR Data Privacy is in the BIR website (www.bir.gov.ph)", left, y + 8);
+
+  return doc;
+}
+
+// Single supplier — download the PDF directly (mirrors downloadOne2316).
+async function downloadOne2307(filingDetails, supplierGroup, quarterInfo) {
+  const jsPDFCtor = await withTimeout(loadJsPDF(), 8000);
+  const doc = await build2307Pdf(jsPDFCtor, filingDetails, supplierGroup, quarterInfo);
+  const name = supplierGroup.payeeName.replace(/[^a-zA-Z0-9]+/g, "_");
+  doc.save(`2307_${name}_${quarterInfo.year}Q${quarterInfo.quarter}.pdf`);
+}
+
+// Multiple suppliers — one PDF each, zipped (mirrors downloadAll2316Zip).
+async function downloadAll2307Zip(filingDetails, supplierGroups, quarterInfo) {
+  const [jsPDFCtor, JSZipCtor] = await Promise.all([withTimeout(loadJsPDF(), 8000), withTimeout(loadJSZip(), 8000)]);
+  const zip = new JSZipCtor();
+  for (const group of supplierGroups) {
+    const doc = await build2307Pdf(jsPDFCtor, filingDetails, group, quarterInfo);
+    const name = group.payeeName.replace(/[^a-zA-Z0-9]+/g, "_");
+    zip.file(`2307_${name}_${quarterInfo.year}Q${quarterInfo.quarter}.pdf`, doc.output("blob"));
+  }
+  const blob = await withTimeout(zip.generateAsync({ type: "blob" }), 8000);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `2307_Certificates_${quarterInfo.year}Q${quarterInfo.quarter}.zip`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+// Shared hook for the "Generate 2307" button on the Purchase Journal and Cash Disbursements pages.
+function useGenerate2307(data, journalKey) {
+  const [status, setStatus] = useState(null);
+  const filingDetails = useMemo(
+    () => buildFilingDetails(data, { month: null, year: null, quarter: null, sawtFormType: null }),
+    [data]
+  );
+  const generate = async (selectedRows) => {
+    const { groups, quarterInfo, error } = build2307SupplierGroups(selectedRows, journalKey, data);
+    if (error) {
+      setStatus({ type: "error", text: error });
+      setTimeout(() => setStatus(null), 7000);
+      return;
+    }
+    setStatus({ type: "pending", text: `Generating ${groups.length} certificate${groups.length === 1 ? "" : "s"}…` });
+    try {
+      if (groups.length === 1) {
+        await downloadOne2307(filingDetails, groups[0], quarterInfo);
+        setStatus({ type: "success", text: "2307 certificate downloaded." });
+      } else {
+        await downloadAll2307Zip(filingDetails, groups, quarterInfo);
+        setStatus({ type: "success", text: `Downloaded ${groups.length} certificates (Q${quarterInfo.quarter} ${quarterInfo.year}) in a ZIP.` });
+      }
+    } catch (e) {
+      setStatus({ type: "error", text: "Couldn't generate the certificate(s) — check your connection and try again." });
+    }
+    setTimeout(() => setStatus(null), 6000);
+  };
+  return { status, generate };
+}
+
 function EmployeeEntryModal({ data, initial, onCancel, onSubmit }) {
   const [v, setV] = useState(initial || {
     year: new Date().getFullYear(), tin: "", lastName: "", firstName: "", middleName: "", nationality: "", address: "", zipCode: "",
@@ -6320,6 +6879,16 @@ function Style() {
       .primary-btn:hover { background: var(--green-deep); }
       .primary-btn.danger { background: var(--red); }
       .primary-btn.danger:hover { background: #7f322f; }
+      .primary-btn:disabled { background: var(--line); color: var(--ink-soft); cursor: default; }
+      .primary-btn:disabled:hover { background: var(--line); }
+
+      /* Company Details — explicit Save */
+      .company-save-bar { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 22px; }
+      .company-save-bar .primary-btn { margin-left: 0; }
+      .save-confirm { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 13px; font-weight: 600; }
+      .save-pending-note { font-size: 12px; color: var(--ink-soft); }
+      .signature-upload { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
       .confirm-box { max-width: 420px; }
       .confirm-body p { margin: 0; font-size: 13px; color: var(--ink); line-height: 1.55; }
 
