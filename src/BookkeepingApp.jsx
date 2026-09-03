@@ -5572,43 +5572,59 @@ async function build2307Pdf(jsPDFCtor, filingDetails, supplierGroup, quarterInfo
   // shading across the whole form" is fixing.
   const GRAY = [222, 222, 222];
 
-  // ---- Header ----
+  // ---- Header / masthead ----
+  // Matches the real BIR Form 2307 top band: one full-width bordered rectangle split into
+  // three columns \u2014 [ For BIR Use Only / BCS Item  over  BIR Form No. 2307 January 2018 (ENCS) ]
+  // | [ seal + Republic of the Philippines \u2026 over the title ] | [ barcode over "2307 01/18ENCS" ].
   doc.setDrawColor(0); doc.setLineWidth(0.75);
-  doc.rect(left, y, 90, 34);
+  const headTop = y;
+  const headH = 72;
+  const fbRowH = 26;                     // height of the "For BIR Use Only" sub-cell
+  const colForm = left + 132;            // left column / centre column divider
+  const colBarcode = right - 106;        // centre column / barcode column divider
+
+  // Outer rectangle, column dividers (full height), and the horizontal split in the left column.
+  doc.rect(left, headTop, right - left, headH);
+  doc.line(colForm, headTop, colForm, headTop + headH);
+  doc.line(colBarcode, headTop, colBarcode, headTop + headH);
+  doc.line(left, headTop + fbRowH, colForm, headTop + fbRowH);
+
+  // Left column, top sub-cell.
   doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
-  doc.text("For BIR", left + 4, y + 10);
-  doc.text("Use Only", left + 4, y + 17);
-  doc.text("BCS/", left + 4, y + 26);
-  doc.text("Item:", left + 4, y + 33);
+  doc.text("For BIR", left + 5, headTop + 10);
+  doc.text("Use Only", left + 5, headTop + 20);
+  doc.text("BCS/", left + 62, headTop + 10);
+  doc.text("Item:", left + 62, headTop + 20);
 
-  doc.addImage(`data:image/png;base64,${BIR_SEAL_BASE64}`, "PNG", 275, y - 2, 45, 40);
+  // Left column, bottom sub-cell.
+  const formY = headTop + fbRowH;
+  doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
+  doc.text("BIR Form No.", left + 5, formY + 11);
+  doc.setFontSize(16); doc.setFont("helvetica", "bold");
+  doc.text("2307", left + 6, formY + 32);
+  doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
+  doc.text("January 2018 (ENCS)", left + 5, formY + 43);
 
+  // Centre column: seal + Republic of the Philippines block (upper), form title (lower).
+  const titleCx = (colForm + colBarcode) / 2;
+  doc.addImage(`data:image/png;base64,${BIR_SEAL_BASE64}`, "PNG", titleCx - 94, headTop + 4, 30, 28);
   doc.setFontSize(8); doc.setFont("helvetica", "bold");
-  doc.text("Republic of the Philippines", 297.5, y + 44, { align: "center" });
-  doc.text("Department of Finance", 297.5, y + 53, { align: "center" });
-  doc.text("Bureau of Internal Revenue", 297.5, y + 62, { align: "center" });
+  doc.text("Republic of the Philippines", titleCx + 10, headTop + 13, { align: "center" });
+  doc.text("Department of Finance", titleCx + 10, headTop + 22, { align: "center" });
+  doc.text("Bureau of Internal Revenue", titleCx + 10, headTop + 31, { align: "center" });
+  doc.setFontSize(14); doc.setFont("helvetica", "bold");
+  doc.text("Certificate of Creditable", titleCx, headTop + 51, { align: "center" });
+  doc.text("Tax Withheld At Source", titleCx, headTop + 66, { align: "center" });
 
-  const formBoxX = left, formBoxY = y + 34;
-  doc.rect(formBoxX, formBoxY, 90, 40);
+  // Barcode column.
+  doc.addImage(`data:image/png;base64,${BIR_BARCODE_BASE64}`, "PNG", colBarcode + 4, headTop + 8, right - colBarcode - 8, 20);
   doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
-  doc.text("BIR Form No.", formBoxX + 4, formBoxY + 8);
-  doc.setFontSize(15); doc.setFont("helvetica", "bold");
-  doc.text("2307", formBoxX + 4, formBoxY + 24);
-  doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
-  doc.text("January 2018 (ENCS)", formBoxX + 4, formBoxY + 34);
+  doc.text("2307 01/18ENCS", right - 4, headTop + headH - 6, { align: "right" });
 
-  doc.setFontSize(15); doc.setFont("helvetica", "bold");
-  doc.text("Certificate of Creditable", 297.5, y + 76, { align: "center" });
-  doc.text("Tax Withheld At Source", 297.5, y + 94, { align: "center" });
-
-  doc.addImage(`data:image/png;base64,${BIR_BARCODE_BASE64}`, "PNG", right - 100, y, 100, 22);
-  doc.setFontSize(6.5); doc.setFont("helvetica", "normal");
-  doc.text("2307 01/18ENCS", right, y + 30, { align: "right" });
-
-  y = y + 94 + 12;
-  doc.setFontSize(7.5);
-  doc.text("Fill in all applicable spaces. Mark all appropriate boxes with an \u201cX\u201d.", left, y);
-  y += 10;
+  y = headTop + headH;
+  doc.setFontSize(7.5); doc.setFont("helvetica", "normal");
+  doc.text("Fill in all applicable spaces. Mark all appropriate boxes with an \u201cX\u201d.", left, y + 9);
+  y += 12;
 
   // ---- Field 1: Period ----
   doc.rect(left, y, right - left, 16);
