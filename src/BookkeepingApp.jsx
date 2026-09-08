@@ -3058,6 +3058,63 @@ function SelectionBar({ count, onClear, children }) {
   );
 }
 
+/* ============================== PAGINATION ============================== */
+
+// Slices an already-filtered/searched array down to one page for rendering. Totals, exports and
+// selection all keep operating on the full filtered array — only the rendered rows are sliced.
+function usePagination(filteredRows, defaultPageSize = 100) {
+  const [pageSize, setPageSize] = useState(defaultPageSize);
+  const [page, setPage] = useState(1);
+  const total = filteredRows.length;
+  // Back to page 1 whenever the filtered set size or the page size changes (filter / search / page-size edits).
+  useEffect(() => { setPage(1); }, [total, pageSize]);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, totalPages); // guard a stale page landing past the end
+  const startIdx = (safePage - 1) * pageSize;
+  const pageRows = filteredRows.slice(startIdx, startIdx + pageSize);
+  return {
+    pageRows, page: safePage, setPage, totalPages, pageSize, setPageSize, total,
+    rangeStart: total === 0 ? 0 : startIdx + 1,
+    rangeEnd: startIdx + pageRows.length,
+  };
+}
+
+function PageSizeSelect({ pg }) {
+  return (
+    <select className="io-select" value={pg.pageSize} onChange={(e) => pg.setPageSize(Number(e.target.value))} title="Rows per page">
+      <option value={25}>25 / page</option>
+      <option value={50}>50 / page</option>
+      <option value={100}>100 / page</option>
+    </select>
+  );
+}
+
+function PaginationBar({ pg, className }) {
+  if (pg.totalPages <= 1) return null;
+  return (
+    <div className={"pagination-bar" + (className ? " " + className : "")}>
+      <span className="pagination-range">Showing {pg.rangeStart.toLocaleString()}–{pg.rangeEnd.toLocaleString()} of {pg.total.toLocaleString()}</span>
+      <div className="pagination-nav">
+        <button className="io-btn" disabled={pg.page === 1} onClick={() => pg.setPage(pg.page - 1)}>Previous</button>
+        <span className="pagination-page">Page {pg.page} of {pg.totalPages}</span>
+        <button className="io-btn" disabled={pg.page === pg.totalPages} onClick={() => pg.setPage(pg.page + 1)}>Next</button>
+      </div>
+    </div>
+  );
+}
+
+// Optional second action: shown only once every row on the current page is selected, so bulk
+// actions on rows the user can't see are always a deliberate extra click, never the default.
+function SelectAllMatching({ sel, filteredRows, pageRows }) {
+  const pageFull = pageRows.length > 0 && pageRows.every((r) => sel.selected.has(r.id));
+  if (!pageFull || sel.selected.size >= filteredRows.length) return null;
+  return (
+    <button className="io-btn" onClick={() => sel.toggleAll(filteredRows.map((r) => r.id))}>
+      Select all {filteredRows.length.toLocaleString()} matching
+    </button>
+  );
+}
+
 function QuickFixModal({ data, count, onCancel, onApply }) {
   const acctOptions = data.coa.filter((a) => ["Cost of Sales","Expense","Asset"].includes(a.type)).map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const vatTypeOptions = data.vatTypes.filter((v) => v.books === "Purchase journal").map((vt) => vt.vatType);
@@ -3171,6 +3228,7 @@ function SalesPage({ data, setData }) {
   }), { vatable: 0, exempt: 0, zeroRated: 0, outputVat: 0, total: 0 });
   const emptyMsg = data.sales.length === 0 ? "No sales logged yet — add your first row above." : "No sales match this filter.";
   const exportHook = useJournalExport("sales", data, filteredRows, coaByCode);
+  const pg = usePagination(filteredRows);
 
   return (
     <div>
@@ -3180,6 +3238,7 @@ function SalesPage({ data, setData }) {
       <ExportStatus status={exportHook.status} />
       {sel.selected.size > 0 && (
         <SelectionBar count={sel.selected.size} onClear={sel.clear}>
+          <SelectAllMatching sel={sel} filteredRows={filteredRows} pageRows={pg.pageRows} />
           <button className="io-btn danger" onClick={onDeleteSelected}><Trash2 size={13} /> Delete selected</button>
         </SelectionBar>
       )}
@@ -3188,6 +3247,7 @@ function SalesPage({ data, setData }) {
           <div className="toolbar-left">
             <PeriodFilterBar filter={filter} setFilter={setFilter} years={getAvailableYears(data)} />
             <SearchBar value={search} onChange={setSearch} placeholder="Search SI No., customer, TIN, description…" />
+            {pg.total > 25 && <PageSizeSelect pg={pg} />}
           </div>
           <AddRowBtn onClick={onAdd}>Add sale</AddRowBtn>
         </div>
@@ -3195,7 +3255,7 @@ function SalesPage({ data, setData }) {
           <table className="ledger-table">
             <thead>
               <tr>
-                <th style={{width:32}}><SelectAllCheckbox ids={filteredRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
+                <th style={{width:32}}><SelectAllCheckbox ids={pg.pageRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
                 <th style={{minWidth:120}}>Date</th><th style={{minWidth:100}}>SI/OR No.</th><th style={{minWidth:180}}>Customer Name</th>
                 <th style={{minWidth:120}}>TIN</th><th style={{minWidth:170}}>Address</th><th style={{minWidth:180}}>Description</th>
                 <th style={{minWidth:110}} className="num-head">VATable Sales</th><th style={{minWidth:110}} className="num-head">VAT-Exempt</th>
@@ -3206,7 +3266,7 @@ function SalesPage({ data, setData }) {
             </thead>
             <tbody>
               {filteredRows.length === 0 && <tr><td colSpan={16} className="empty-row">{emptyMsg}</td></tr>}
-              {filteredRows.map((r) => (
+              {pg.pageRows.map((r) => (
                 <tr key={r.id} className={sel.selected.has(r.id) ? "row-selected" : ""}>
                   <td className="text-center"><RowCheckbox id={r.id} selected={sel.selected} toggle={sel.toggle} /></td>
                   <td><Field type="date" value={r.date} onChange={(v) => update(r.id, { date: v })} /></td>
@@ -3238,6 +3298,7 @@ function SalesPage({ data, setData }) {
             )}
           </table>
         </div>
+        <PaginationBar pg={pg} />
       </div>
       {modalOpen && (
         <SalesEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
@@ -3316,6 +3377,7 @@ function PurchasesPage({ data, setData }) {
   const exportHook = useJournalExport("purchases", data, filteredRows, coaByCode);
   const gen2307 = useGenerate2307(data, "purchases");
   const generate2307Selected = () => gen2307.generate(data.purchases.filter((r) => sel.selected.has(r.id)));
+  const pg = usePagination(filteredRows);
 
   return (
     <div>
@@ -3326,6 +3388,7 @@ function PurchasesPage({ data, setData }) {
       <ExportStatus status={gen2307.status} />
       {sel.selected.size > 0 && (
         <SelectionBar count={sel.selected.size} onClear={sel.clear}>
+          <SelectAllMatching sel={sel} filteredRows={filteredRows} pageRows={pg.pageRows} />
           <button className="io-btn accent" onClick={() => setQuickFixOpen(true)}>Quick Fix</button>
           <button className="io-btn" onClick={generate2307Selected} disabled={gen2307.status?.type === "pending"}><FileDown size={13} /> Generate 2307</button>
           <button className="io-btn danger" onClick={onDeleteSelected}><Trash2 size={13} /> Delete selected</button>
@@ -3336,6 +3399,7 @@ function PurchasesPage({ data, setData }) {
           <div className="toolbar-left">
             <PeriodFilterBar filter={filter} setFilter={setFilter} years={getAvailableYears(data)} />
             <SearchBar value={search} onChange={setSearch} placeholder="Search invoice no., supplier, TIN, description…" />
+            {pg.total > 25 && <PageSizeSelect pg={pg} />}
           </div>
           <AddRowBtn onClick={onAdd}>Add purchase</AddRowBtn>
         </div>
@@ -3343,7 +3407,7 @@ function PurchasesPage({ data, setData }) {
           <table className="ledger-table">
             <thead>
               <tr>
-                <th style={{width:32}}><SelectAllCheckbox ids={filteredRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
+                <th style={{width:32}}><SelectAllCheckbox ids={pg.pageRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
                 <th style={{minWidth:120}}>Date</th><th style={{minWidth:110}}>Supplier Inv./OR</th><th style={{minWidth:190}}>Supplier Name</th>
                 <th style={{minWidth:120}}>TIN</th><th style={{minWidth:160}}>Address</th>
                 <th style={{minWidth:150}}>Item Code</th><th style={{minWidth:160}}>Description</th><th style={{minWidth:200}}>VAT Type</th>
@@ -3356,7 +3420,7 @@ function PurchasesPage({ data, setData }) {
             </thead>
             <tbody>
               {filteredRows.length === 0 && <tr><td colSpan={21} className="empty-row">{emptyMsg}</td></tr>}
-              {filteredRows.map((r) => (
+              {pg.pageRows.map((r) => (
                 <tr key={r.id} className={sel.selected.has(r.id) ? "row-selected" : ""}>
                   <td className="text-center"><RowCheckbox id={r.id} selected={sel.selected} toggle={sel.toggle} /></td>
                   <td><Field type="date" value={r.date} onChange={(v) => update(r.id, { date: v })} /></td>
@@ -3393,6 +3457,7 @@ function PurchasesPage({ data, setData }) {
             )}
           </table>
         </div>
+        <PaginationBar pg={pg} />
       </div>
       {modalOpen && (
         <PurchaseEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
@@ -3456,6 +3521,7 @@ function DisbursementsPage({ data, setData }) {
   const exportHook = useJournalExport("disbursements", data, filteredRows, coaByCode);
   const gen2307 = useGenerate2307(data, "disbursements");
   const generate2307Selected = () => gen2307.generate(data.disbursements.filter((r) => sel.selected.has(r.id)));
+  const pg = usePagination(filteredRows);
 
   return (
     <div>
@@ -3466,6 +3532,7 @@ function DisbursementsPage({ data, setData }) {
       <ExportStatus status={gen2307.status} />
       {sel.selected.size > 0 && (
         <SelectionBar count={sel.selected.size} onClear={sel.clear}>
+          <SelectAllMatching sel={sel} filteredRows={filteredRows} pageRows={pg.pageRows} />
           <button className="io-btn" onClick={generate2307Selected} disabled={gen2307.status?.type === "pending"}><FileDown size={13} /> Generate 2307</button>
           <button className="io-btn danger" onClick={onDeleteSelected}><Trash2 size={13} /> Delete selected</button>
         </SelectionBar>
@@ -3475,13 +3542,14 @@ function DisbursementsPage({ data, setData }) {
           <div className="toolbar-left">
             <PeriodFilterBar filter={filter} setFilter={setFilter} years={getAvailableYears(data)} />
             <SearchBar value={search} onChange={setSearch} placeholder="Search ref. no., supplier, TIN, description…" />
+            {pg.total > 25 && <PageSizeSelect pg={pg} />}
           </div>
           <AddRowBtn onClick={onAdd}>Add disbursement</AddRowBtn>
         </div>
         <div className="table-scroll">
           <table className="ledger-table">
             <thead><tr>
-              <th style={{width:32}}><SelectAllCheckbox ids={filteredRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
+              <th style={{width:32}}><SelectAllCheckbox ids={pg.pageRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
               <th style={{minWidth:120}}>Date</th><th style={{minWidth:120}}>TIN</th><th style={{minWidth:190}}>Suppliers Name</th><th style={{minWidth:110}}>Payment Ref.</th>
               <th style={{minWidth:200}}>Description</th><th style={{minWidth:180}}>ATC</th><th style={{minWidth:80}} className="num-head">Rate</th>
               <th style={{minWidth:110}} className="num-head">Amount</th>
@@ -3490,7 +3558,7 @@ function DisbursementsPage({ data, setData }) {
             </tr></thead>
             <tbody>
               {filteredRows.length === 0 && <tr><td colSpan={14} className="empty-row">{emptyMsg}</td></tr>}
-              {filteredRows.map((r) => (
+              {pg.pageRows.map((r) => (
                 <tr key={r.id} className={sel.selected.has(r.id) ? "row-selected" : ""}>
                   <td className="text-center"><RowCheckbox id={r.id} selected={sel.selected} toggle={sel.toggle} /></td>
                   <td><Field type="date" value={r.date} onChange={(v) => update(r.id, { date: v })} /></td>
@@ -3517,6 +3585,7 @@ function DisbursementsPage({ data, setData }) {
             )}
           </table>
         </div>
+        <PaginationBar pg={pg} />
       </div>
       {modalOpen && (
         <DisbEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
@@ -3579,6 +3648,7 @@ function ReceiptsPage({ data, setData }) {
   const totals = filteredRows.reduce((a, r) => ({ amount: a.amount + num(r.amount), cwt: a.cwt + num(r.cwt), net: a.net + num(r.net) }), { amount: 0, cwt: 0, net: 0 });
   const emptyMsg = data.receipts.length === 0 ? "No receipts logged yet — add your first row above." : "No receipts match this filter.";
   const exportHook = useJournalExport("receipts", data, filteredRows, coaByCode);
+  const pg = usePagination(filteredRows);
 
   return (
     <div>
@@ -3588,6 +3658,7 @@ function ReceiptsPage({ data, setData }) {
       <ExportStatus status={exportHook.status} />
       {sel.selected.size > 0 && (
         <SelectionBar count={sel.selected.size} onClear={sel.clear}>
+          <SelectAllMatching sel={sel} filteredRows={filteredRows} pageRows={pg.pageRows} />
           <button className="io-btn danger" onClick={onDeleteSelected}><Trash2 size={13} /> Delete selected</button>
         </SelectionBar>
       )}
@@ -3596,13 +3667,14 @@ function ReceiptsPage({ data, setData }) {
           <div className="toolbar-left">
             <PeriodFilterBar filter={filter} setFilter={setFilter} years={getAvailableYears(data)} />
             <SearchBar value={search} onChange={setSearch} placeholder="Search OR no., received from, description…" />
+            {pg.total > 25 && <PageSizeSelect pg={pg} />}
           </div>
           <AddRowBtn onClick={onAdd}>Add receipt</AddRowBtn>
         </div>
         <div className="table-scroll">
           <table className="ledger-table">
             <thead><tr>
-              <th style={{width:32}}><SelectAllCheckbox ids={filteredRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
+              <th style={{width:32}}><SelectAllCheckbox ids={pg.pageRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
               <th style={{minWidth:120}}>Date</th><th style={{minWidth:170}}>Received From</th><th style={{minWidth:110}}>OR/Ref No.</th>
               <th style={{minWidth:200}}>Description</th><th style={{minWidth:180}}>ATC</th><th style={{minWidth:80}} className="num-head">Rate</th>
               <th style={{minWidth:110}} className="num-head">Amount</th>
@@ -3611,7 +3683,7 @@ function ReceiptsPage({ data, setData }) {
             </tr></thead>
             <tbody>
               {filteredRows.length === 0 && <tr><td colSpan={13} className="empty-row">{emptyMsg}</td></tr>}
-              {filteredRows.map((r) => (
+              {pg.pageRows.map((r) => (
                 <tr key={r.id} className={sel.selected.has(r.id) ? "row-selected" : ""}>
                   <td className="text-center"><RowCheckbox id={r.id} selected={sel.selected} toggle={sel.toggle} /></td>
                   <td><Field type="date" value={r.date} onChange={(v) => update(r.id, { date: v })} /></td>
@@ -3637,6 +3709,7 @@ function ReceiptsPage({ data, setData }) {
             )}
           </table>
         </div>
+        <PaginationBar pg={pg} />
       </div>
       {modalOpen && (
         <ReceiptEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
@@ -3687,6 +3760,7 @@ function GeneralJournalPage({ data, setData }) {
   const filteredVouchers = useMemo(() => data.generalJournal.filter((jv) => matchesPeriod(jv.date, filter)), [data.generalJournal, filter]);
   const emptyMsg = data.generalJournal.length === 0 ? "No journal vouchers yet — add one above." : "No vouchers match this filter.";
   const exportHook = useJournalExport("generaljournal", data, filteredVouchers, coaByCode);
+  const pg = usePagination(filteredVouchers);
 
   const searchResults = useMemo(() => {
     if (!search.trim()) return [];
@@ -3739,19 +3813,21 @@ function GeneralJournalPage({ data, setData }) {
         <>
           <div className="table-toolbar gj-filter-bar">
             <PeriodFilterBar filter={filter} setFilter={setFilter} years={getAvailableYears(data)} />
+            {pg.total > 25 && <PageSizeSelect pg={pg} />}
             {filteredVouchers.length > 0 && (
               <label className="qf-check gj-select-all">
-                <SelectAllCheckbox ids={filteredVouchers.map((jv) => jv.id)} selected={sel.selected} toggleAll={sel.toggleAll} /> Select all shown
+                <SelectAllCheckbox ids={pg.pageRows.map((jv) => jv.id)} selected={sel.selected} toggleAll={sel.toggleAll} /> Select all shown
               </label>
             )}
           </div>
           {sel.selected.size > 0 && (
             <SelectionBar count={sel.selected.size} onClear={sel.clear}>
+              <SelectAllMatching sel={sel} filteredRows={filteredVouchers} pageRows={pg.pageRows} />
               <button className="io-btn danger" onClick={onDeleteSelected}><Trash2 size={13} /> Delete selected</button>
             </SelectionBar>
           )}
           {filteredVouchers.length === 0 && <div className="empty-panel">{emptyMsg}</div>}
-          {filteredVouchers.map((jv) => {
+          {pg.pageRows.map((jv) => {
             const debitSum = round2(jv.lines.reduce((a, l) => a + num(l.debit), 0));
             const creditSum = round2(jv.lines.reduce((a, l) => a + num(l.credit), 0));
             const balanced = debitSum === creditSum && debitSum > 0;
@@ -3785,6 +3861,7 @@ function GeneralJournalPage({ data, setData }) {
               </div>
             );
           })}
+          <PaginationBar pg={pg} className="gj-pagination-bar" />
         </>
       )}
 
@@ -3864,6 +3941,20 @@ function GeneralLedgerDetailPage({ data, postings, coaMap }) {
   const totals = groups.reduce((a, g) => g.rows.reduce((b, r) => ({ debit: b.debit + r.debit, credit: b.credit + r.credit }), a), { debit: 0, credit: 0 });
   const exportHook = useGeneralLedgerExport(data, groups, year);
 
+  // Flatten the grouped ledger into one list of display rows so pagination can slice at a fixed
+  // row count regardless of how the transactions are distributed across accounts.
+  const displayRows = useMemo(() => {
+    const out = [];
+    groups.forEach((g) => {
+      out.push({ kind: "header", g });
+      out.push({ kind: "opening", g });
+      g.rows.forEach((r) => out.push({ kind: "txn", r, g }));
+      out.push({ kind: "closing", g });
+    });
+    return out;
+  }, [groups]);
+  const pg = usePagination(displayRows);
+
   return (
     <div>
       <SectionHeader icon={BookOpenText} title="General Ledger" subtitle="Every transaction posted to every account for the selected year, with opening/closing balances and a running balance per account."
@@ -3883,6 +3974,9 @@ function GeneralLedgerDetailPage({ data, postings, coaMap }) {
       </div>
 
       <div className="ledger-wrap">
+        {pg.total > 25 && (
+          <div className="table-toolbar"><div className="toolbar-left"><PageSizeSelect pg={pg} /></div></div>
+        )}
         <div className="table-scroll">
           <table className="ledger-table report-table">
             <thead>
@@ -3895,32 +3989,36 @@ function GeneralLedgerDetailPage({ data, postings, coaMap }) {
             </thead>
             <tbody>
               {groups.length === 0 && <tr><td colSpan={9} className="empty-row">No transactions or balances for {year} yet.</td></tr>}
-              {groups.map((g) => (
-                <React.Fragment key={g.code}>
-                  <tr className="gl-group-header"><td colSpan={9}>{g.code} {g.name}</td></tr>
-                  <tr className="gl-open-close">
+              {pg.pageRows.map((row) => {
+                const g = row.g;
+                if (row.kind === "header") return <tr className="gl-group-header" key={"h-" + g.code}><td colSpan={9}>{g.code} {g.name}</td></tr>;
+                if (row.kind === "opening") return (
+                  <tr className="gl-open-close" key={"o-" + g.code}>
                     <td colSpan={8}>{g.code} {g.name} Opening Balances</td>
                     <td className="num">{fmt(g.opening)}</td>
                   </tr>
-                  {g.rows.map((r) => (
-                    <tr key={r.id}>
-                      <td>{r.date}</td>
-                      <td>{TRANSACTION_TYPE_LABELS[r.source] || r.source}</td>
-                      <td>{r.desc || "—"}</td>
-                      <td>{r.ref || "—"}</td>
-                      <td>{r.acctName}</td>
-                      <td>{r.code}</td>
-                      <td className="num">{r.debit ? fmt(r.debit) : "—"}</td>
-                      <td className="num">{r.credit ? fmt(r.credit) : "—"}</td>
-                      <td className="num">{fmt(r.runningBalance)}</td>
-                    </tr>
-                  ))}
-                  <tr className="gl-open-close closing">
+                );
+                if (row.kind === "closing") return (
+                  <tr className="gl-open-close closing" key={"c-" + g.code}>
                     <td colSpan={8}>{g.code} {g.name} Closing Balances</td>
                     <td className="num">{fmt(g.closing)}</td>
                   </tr>
-                </React.Fragment>
-              ))}
+                );
+                const r = row.r;
+                return (
+                  <tr key={r.id}>
+                    <td>{r.date}</td>
+                    <td>{TRANSACTION_TYPE_LABELS[r.source] || r.source}</td>
+                    <td>{r.desc || "—"}</td>
+                    <td>{r.ref || "—"}</td>
+                    <td>{r.acctName}</td>
+                    <td>{r.code}</td>
+                    <td className="num">{r.debit ? fmt(r.debit) : "—"}</td>
+                    <td className="num">{r.credit ? fmt(r.credit) : "—"}</td>
+                    <td className="num">{fmt(r.runningBalance)}</td>
+                  </tr>
+                );
+              })}
             </tbody>
             {groups.length > 0 && (
               <tfoot><tr>
@@ -3930,6 +4028,7 @@ function GeneralLedgerDetailPage({ data, postings, coaMap }) {
             )}
           </table>
         </div>
+        <PaginationBar pg={pg} />
       </div>
     </div>
   );
@@ -7301,6 +7400,11 @@ function Style() {
       .rc-note { font-size: 11.5px; color: var(--ink-soft); padding: 0 6px; margin: 6px 0 2px; line-height: 1.5; }
       .rc-warn { font-size: 12px; color: var(--ink-soft); background: var(--white); border: 1px solid var(--line); border-left: 3px solid var(--gold); border-radius: 8px; padding: 12px 14px; margin-top: 18px; line-height: 1.6; }
       .ledger-wrap { background: var(--white); border: 1px solid var(--line); border-radius: 10px; padding: 4px; margin-bottom: 8px; }
+      .pagination-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 8px 8px 6px; border-top: 1px solid var(--line-soft); margin-top: 2px; }
+      .pagination-range { font-size: 12px; color: var(--ink-soft); }
+      .pagination-nav { display: flex; align-items: center; gap: 10px; }
+      .pagination-page { font-size: 12px; color: var(--green-deep); font-weight: 500; white-space: nowrap; }
+      .gj-pagination-bar { border-top: none; padding-top: 12px; }
       .table-toolbar { display: flex; justify-content: space-between; align-items: center; padding: 6px 6px 2px; flex-wrap: wrap; gap: 10px; }
       .table-toolbar .add-row-btn { margin: 0; }
       .toolbar-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1; }
