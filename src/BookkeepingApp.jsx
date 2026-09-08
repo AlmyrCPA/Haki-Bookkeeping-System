@@ -545,65 +545,9 @@ const JOURNAL_SHEETS = {
   form2307: { title: "Creditable Withholding Taxes", cols: FORM2307_COLS, dataKey: "form2307" },
   employees: { title: "Alphalist of Employees", cols: EMPLOYEE_COLS, dataKey: "employees" },
 };
-const REFERENCE_SHEET_NAMES = ["Instructions", "Chart of Accounts", "Item Record", "Customers Master", "Suppliers Master", "ATC Reference"];
-
-function buildReferenceSheets(wb, data) {
-  const coaRows = [["Code", "Account Name", "Type", "Category"], ...data.coa.map((a) => [a.code, a.name, a.type, a.category])];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(coaRows), "Chart of Accounts");
-
-  const itemRows = [["Item", "Default Account Code", "Type"], ...data.items.map((i) => [i.item, i.account, i.type])];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(itemRows), "Item Record");
-
-  const custRows = [["TIN", "Customer Name", "Address", "Type", "Account"], ...data.customers.map((c) => [c.tin, c.name, c.address, c.type, c.account])];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(custRows), "Customers Master");
-
-  const suppRows = [["TIN", "Supplier Name", "Address", "Item Code", "Account Title", "Type"], ...data.suppliers.map((s) => [s.tin, s.name, s.address, s.itemCode, s.accountTitle, s.type])];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(suppRows), "Suppliers Master");
-
-  const atcRows = [["ATC Code", "Rate", "Description"], ...data.atc.map((a) => [a.code, a.rate, a.desc])];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(atcRows), "ATC Reference");
-}
-
-function buildInstructionsSheet(journalKey, data) {
-  const meta = JOURNAL_SHEETS[journalKey];
-  const lines = [
-    [`${meta.title} — Import Template`],
-    [""],
-    ["How to use this file"],
-    [`1. Fill out the "${meta.title}" sheet starting on row 2. Keep the header row and column order as-is.`],
-    ["2. Enter dates as MM/DD/YYYY, e.g. 01/31/2026."],
-    ["3. \"Account Code\" must match a code on the \"Chart of Accounts\" sheet."],
-  ];
-  if (journalKey === "sales") {
-    lines.push(["4. \"Customer Name\" should match a name on the \"Customers Master\" sheet so TIN and Address auto-fill on import."]);
-    lines.push(["5. \"Terms\" must be Cash or Credit. \"Bank Account\" must be Cash on Hand or Cash in Bank (ignored when Terms = Credit)."]);
-  } else if (journalKey === "purchases") {
-    lines.push(["4. \"Supplier Name\" should match a name on the \"Suppliers Master\" sheet, and \"Item Code / Description\" should match the \"Item Record\" sheet, so details and account auto-fill on import."]);
-    lines.push(["5. \"Terms\" must be Cash or Credit. \"Bank Account\" must be Cash on Hand or Cash in Bank (ignored when Terms = Credit)."]);
-  } else if (journalKey === "disbursements" || journalKey === "receipts") {
-    lines.push(["4. \"Bank Account\" must be Cash on Hand or Cash in Bank."]);
-  } else if (journalKey === "generaljournal") {
-    lines.push(["4. Give every line of the same voucher the same \"JV No.\" — matching JV numbers are grouped back into one voucher on import."]);
-    lines.push(["5. Make sure each voucher's total Debit equals its total Credit."]);
-  }
-  lines.push([""]);
-  lines.push(["VAT, EWT/CWT, and Net/Total amounts are calculated automatically by the app — leave those out."]);
-  lines.push([""]);
-  lines.push(["Adding your own Excel dropdowns (optional)"]);
-  lines.push(["Select the column, then Data > Data Validation > List, and set the source to a range on the reference sheets below, for example:"]);
-  lines.push([`  Account Code column   ->   ='Chart of Accounts'!$A$2:$A$${data.coa.length + 1}`]);
-  if (journalKey === "sales") lines.push([`  Customer Name column   ->   ='Customers Master'!$B$2:$B$${data.customers.length + 1}`]);
-  if (journalKey === "purchases") {
-    lines.push([`  Supplier Name column   ->   ='Suppliers Master'!$B$2:$B$${data.suppliers.length + 1}`]);
-    lines.push([`  Item Code column   ->   ='Item Record'!$A$2:$A$${data.items.length + 1}`]);
-  }
-  lines.push([""]);
-  lines.push(["Reference sheets included in this workbook: Chart of Accounts, Item Record, Customers Master, Suppliers Master, ATC Reference."]);
-  lines.push(["Importing this file ADDS new rows/vouchers — it never overwrites or removes what's already in the app."]);
-  const ws = XLSX.utils.aoa_to_sheet(lines);
-  ws["!cols"] = [{ wch: 100 }];
-  return ws;
-}
+// Sheet names that are NOT the entry sheet in an import workbook — used to locate the entry
+// sheet by elimination. Includes the reference/context tabs and the dropdown "Lists" tab.
+const REFERENCE_SHEET_NAMES = ["Instructions", "Chart of Accounts", "Item Record", "Customers Master", "Suppliers Master", "ATC Reference", "VAT Type", "Lists"];
 
 function buildEntryAOA(journalKey, data) {
   const meta = JOURNAL_SHEETS[journalKey];
@@ -623,15 +567,176 @@ function buildEntryAOA(journalKey, data) {
   return [header, ...rows];
 }
 
-function downloadJournalTemplate(journalKey, data) {
+/* ============================== IMPORT TEMPLATES WITH IN-CELL DROPDOWNS ============================== */
+// Templates are generated with `exceljs`, not `xlsx`: SheetJS's free build silently drops data
+// validation on write, so it cannot produce working in-cell dropdowns (that's a paid SheetJS Pro
+// feature). `xlsx` still handles everything else — reading imported files, the export reports, and
+// the DAT-adjacent Excel outputs. `exceljs` is dynamically imported so it stays out of the main bundle.
+
+const TEMPLATE_ROW_BUFFER = 300; // blank rows a fresh template offers with dropdowns already applied
+
+// Fixed value lists — placed on a hidden-in-plain-sight "Lists" tab and referenced by range so
+// there's no 255-char inline-list limit to worry about.
+const TEMPLATE_FIXED_LISTS = {
+  "Party Type": PARTY_TYPES,
+  "Terms": TERMS,
+  "Bank Account": BANK_ACCOUNTS,
+  "Yes / No": ["Y", "N"],
+  "Employment Status": ["R", "CP", "C", "P", "S"],
+  "Item Type": ITEM_TYPES,
+  "COA Class": COA_TYPES,
+  "COA Subclass": COA_SUBCLASSES,
+  "COA Account Type": COA_ACCOUNT_TYPES,
+  "VAT Books": VAT_TYPE_BOOKS,
+  "SLSPI Field": VAT_TYPE_SLSPI_FIELDS,
+};
+
+// field -> dropdown source. { list: "<key in TEMPLATE_FIXED_LISTS>" } | { sheet, col }
+const JOURNAL_TEMPLATE_DROPDOWNS = {
+  sales: { customer: { sheet: "Customers Master", col: "B" }, terms: { list: "Terms" }, coaCode: { sheet: "Chart of Accounts", col: "A" }, bankAccount: { list: "Bank Account" } },
+  purchases: { supplier: { sheet: "Suppliers Master", col: "B" }, itemCode: { sheet: "Item Record", col: "A" }, vatType: { sheet: "VAT Type", col: "A" }, atc: { sheet: "ATC Reference", col: "A" }, terms: { list: "Terms" }, coaCode: { sheet: "Chart of Accounts", col: "A" }, bankAccount: { list: "Bank Account" } },
+  disbursements: { vendor: { sheet: "Suppliers Master", col: "B" }, atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
+  receipts: { atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
+  generaljournal: { account: { sheet: "Chart of Accounts", col: "A" } },
+  form2307: { atc: { sheet: "ATC Reference", col: "A" } },
+  employees: { isMWE: { list: "Yes / No" }, substitutedFiling: { list: "Yes / No" }, empStatus: { list: "Employment Status" }, prevEmpStatus: { list: "Employment Status" } },
+};
+
+const MASTER_TEMPLATE_DROPDOWNS = {
+  "Chart of Accounts": { type: { list: "COA Class" }, category: { list: "COA Subclass" }, accountType: { list: "COA Account Type" } },
+  "Customers Master": { type: { list: "Party Type" } },
+  "Suppliers Master": { type: { list: "Party Type" }, itemCode: { sheet: "Item Record", col: "A" }, accountTitle: { sheet: "Chart of Accounts", col: "B" } },
+  "Item Record": { account: { sheet: "Chart of Accounts", col: "A" }, type: { list: "Item Type" } },
+  "ATC Reference": {},
+  "VAT Type": { books: { list: "VAT Books" }, slspiField: { list: "SLSPI Field" } },
+};
+
+const excelColLetter = (n) => { let s = ""; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = (n - m - 1) / 26; } return s; };
+
+async function loadExcelJS() {
+  const mod = await import("exceljs");
+  return mod.default || mod;
+}
+
+// Adds reference/context tabs the dropdowns point at. Skips any name that already exists (a master
+// template's own entry sheet can share a name with a reference tab). Returns { [sheetName]: rowCount }.
+function addTemplateRefSheets(wb, data) {
+  const sheets = {};
+  const add = (name, header, rows) => {
+    const existing = wb.getWorksheet(name);
+    if (existing) { sheets[name] = Math.max(0, existing.rowCount - 1); return; }
+    const ws = wb.addWorksheet(name);
+    ws.addRow(header);
+    ws.getRow(1).font = { bold: true };
+    rows.forEach((r) => ws.addRow(r));
+    header.forEach((_, i) => { ws.getColumn(i + 1).width = 26; });
+    sheets[name] = rows.length;
+  };
+  add("Chart of Accounts", ["Code", "Account Name", "Class"], (data.coa || []).map((a) => [a.code, a.name, a.type]));
+  add("Item Record", ["Item", "Default Account Code", "Type"], (data.items || []).map((i) => [i.item, i.account, i.type]));
+  add("Customers Master", ["TIN", "Customer Name", "Address"], (data.customers || []).map((c) => [c.tin, c.name, c.address]));
+  add("Suppliers Master", ["TIN", "Supplier Name", "Address"], (data.suppliers || []).map((s) => [s.tin, s.name, s.address]));
+  add("ATC Reference", ["ATC Code", "Rate", "Description"], (data.atc || []).map((a) => [a.code, a.rate, a.desc]));
+  add("VAT Type", ["VAT Type", "Books"], (data.vatTypes || []).map((v) => [v.vatType, v.books]));
+  return sheets;
+}
+
+// Adds a "Lists" tab with the fixed value lists (one per column) and returns their A1 ranges.
+function addTemplateListsSheet(wb, listKeys) {
+  if (listKeys.length === 0) return {};
+  const ws = wb.getWorksheet("Lists") || wb.addWorksheet("Lists");
+  const ranges = {};
+  listKeys.forEach((key, i) => {
+    const letter = excelColLetter(i + 1);
+    const values = TEMPLATE_FIXED_LISTS[key] || [];
+    ws.getCell(`${letter}1`).value = key;
+    ws.getCell(`${letter}1`).font = { bold: true };
+    values.forEach((v, r) => { ws.getCell(`${letter}${r + 2}`).value = v; });
+    ws.getColumn(i + 1).width = Math.max(14, key.length + 4);
+    ranges[key] = `Lists!$${letter}$2:$${letter}$${values.length + 1}`;
+  });
+  return ranges;
+}
+
+// Applies one list-type data validation per dropdown column across rows 2..lastRow.
+function applyTemplateDropdowns(sheet, fieldColIndex, dropdownCfg, refSheets, listRanges, lastRow) {
+  Object.entries(dropdownCfg).forEach(([field, cfg]) => {
+    const ci = fieldColIndex[field];
+    if (!ci) return;
+    let formula;
+    if (cfg.list) formula = listRanges[cfg.list];
+    else if (cfg.sheet) {
+      const count = refSheets[cfg.sheet] || 0;
+      if (count === 0) return; // no values to choose from yet — leave the column free-text
+      const col = cfg.col || "A";
+      formula = `'${cfg.sheet}'!$${col}$2:$${col}$${count + 1}`;
+    }
+    if (!formula) return;
+    const letter = excelColLetter(ci);
+    sheet.dataValidations.add(`${letter}2:${letter}${lastRow}`, {
+      type: "list", allowBlank: true, showErrorMessage: false, formulae: [formula],
+    });
+  });
+}
+
+async function saveExcelBuffer(wb, filename) {
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+function templateInstructionLines(journalKey) {
   const meta = JOURNAL_SHEETS[journalKey];
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, buildInstructionsSheet(journalKey, data), "Instructions");
-  const entryWs = XLSX.utils.aoa_to_sheet(buildEntryAOA(journalKey, data));
-  entryWs["!cols"] = meta.cols.map((c) => ({ wch: Math.max(14, c.header.length + 2) }));
-  XLSX.utils.book_append_sheet(wb, entryWs, meta.title.slice(0, 31));
-  buildReferenceSheets(wb, data);
-  XLSX.writeFile(wb, `${meta.title.replace(/\s+/g, "-")}-Template.xlsx`);
+  const lines = [
+    `${meta.title} — Import Template`,
+    "",
+    "How to use this file",
+    `1. Fill out the "${meta.title}" sheet starting on row 2. Keep the header row and column order as-is.`,
+    "2. Enter dates as MM/DD/YYYY, e.g. 01/31/2026.",
+    "3. Columns with a dropdown arrow (Account Code, ATC Code, Terms, Bank Account, etc.) accept only values from the list — pick from the dropdown, don't type.",
+  ];
+  if (journalKey === "sales") lines.push('4. Pick the customer from the "Customer Name" dropdown so TIN and Address auto-fill on import.');
+  else if (journalKey === "purchases") lines.push('4. Pick the supplier and item from their dropdowns so details and account auto-fill on import.');
+  else if (journalKey === "generaljournal") lines.push('4. Give every line of the same voucher the same "JV No." — matching JV numbers are grouped back into one voucher on import.', "5. Make sure each voucher's total Debit equals its total Credit.");
+  lines.push(
+    "",
+    "VAT, EWT/CWT, and Net/Total amounts are calculated automatically by the app — leave those out.",
+    "",
+    "The extra tabs (Chart of Accounts, ATC Reference, Lists, …) are the sources for the dropdowns — browse them for reference, but you don't need to edit them.",
+    "Importing this file ADDS new rows/vouchers — it never overwrites or removes what's already in the app.",
+  );
+  return lines;
+}
+
+async function downloadJournalTemplate(journalKey, data) {
+  const ExcelJS = await loadExcelJS();
+  const meta = JOURNAL_SHEETS[journalKey];
+  const wb = new ExcelJS.Workbook();
+
+  const instr = wb.addWorksheet("Instructions");
+  instr.getColumn(1).width = 110;
+  templateInstructionLines(journalKey).forEach((line) => instr.addRow([line]));
+
+  const sheet = wb.addWorksheet(meta.title.slice(0, 31));
+  sheet.columns = meta.cols.map((c) => ({ header: c.header, key: c.field, width: Math.max(14, c.header.length + 2) }));
+  sheet.getRow(1).font = { bold: true };
+  const [, ...existing] = buildEntryAOA(journalKey, data); // drop the header row we already have
+  existing.forEach((r) => sheet.addRow(r));
+
+  const dropdownCfg = JOURNAL_TEMPLATE_DROPDOWNS[journalKey] || {};
+  const refSheets = addTemplateRefSheets(wb, data);
+  const listKeys = [...new Set(Object.values(dropdownCfg).filter((c) => c.list).map((c) => c.list))];
+  const listRanges = addTemplateListsSheet(wb, listKeys);
+
+  const fieldColIndex = {};
+  meta.cols.forEach((c, i) => { fieldColIndex[c.field] = i + 1; });
+  applyTemplateDropdowns(sheet, fieldColIndex, dropdownCfg, refSheets, listRanges, Math.max(existing.length + 1, TEMPLATE_ROW_BUFFER));
+
+  await saveExcelBuffer(wb, `${meta.title.replace(/\s+/g, "-")}-Template.xlsx`);
 }
 
 async function importJournalExcel(journalKey, file, data) {
@@ -742,41 +847,154 @@ async function importJournalExcel(journalKey, file, data) {
   return { newRows };
 }
 
+// journalKey === "generaljournal" counts vouchers; every other journal counts rows.
+function journalImportCount(journalKey, result) {
+  return result.newVouchers ? result.newVouchers.length : (result.newRows ? result.newRows.length : 0);
+}
+
 function useJournalImport(journalKey, data, onImported) {
   const fileInputRef = useRef(null);
   const [status, setStatus] = useState(null);
+  const [preview, setPreview] = useState(null); // { result, fileName, count } — parsed but NOT yet committed
   const triggerImport = () => fileInputRef.current?.click();
+  const flash = (s, ms = 5000) => { setStatus(s); setTimeout(() => setStatus(null), ms); };
   const handleFileChange = async (e) => {
     const file = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!file) return;
     try {
       const result = await importJournalExcel(journalKey, file, data);
-      onImported(result);
-      const count = result.newVouchers ? result.newVouchers.length : result.newRows.length;
-      const noun = journalKey === "generaljournal" ? (count === 1 ? "voucher" : "vouchers") : (count === 1 ? "row" : "rows");
-      setStatus({ type: "success", text: `Imported ${count} ${noun} from "${file.name}".` });
+      const count = journalImportCount(journalKey, result);
+      if (count === 0) { flash({ type: "error", text: `No data rows found in "${file.name}".` }); return; }
+      setPreview({ result, fileName: file.name, count }); // wait for confirmation before merging
     } catch (err) {
-      setStatus({ type: "error", text: `Couldn't read "${file.name}". Make sure it's an .xlsx file using this journal's template with the column order unchanged.` });
+      flash({ type: "error", text: `Couldn't read "${file.name}". Make sure it's an .xlsx file using this journal's template with the column order unchanged.` });
     }
-    setTimeout(() => setStatus(null), 5000);
   };
-  return { fileInputRef, status, triggerImport, handleFileChange };
+  const confirmImport = () => {
+    if (!preview) return;
+    onImported(preview.result);
+    const noun = journalKey === "generaljournal" ? (preview.count === 1 ? "voucher" : "vouchers") : (preview.count === 1 ? "row" : "rows");
+    flash({ type: "success", text: `Imported ${preview.count} ${noun} from "${preview.fileName}".` });
+    setPreview(null);
+  };
+  const cancelImport = () => setPreview(null);
+  return { fileInputRef, status, triggerImport, handleFileChange, preview, confirmImport, cancelImport };
 }
 
 function ImportExportBar({ journalKey, data, importHook }) {
   const title = JOURNAL_SHEETS[journalKey].title;
+  const [tplState, setTplState] = useState(null); // null | "busy" | "error"
+  const p = importHook.preview;
+  const pvRows = p ? previewRows(journalKey, p.result) : [];
+  const gj = journalKey === "generaljournal";
+  const handleTemplate = async () => {
+    setTplState("busy");
+    try { await downloadJournalTemplate(journalKey, data); setTplState(null); }
+    catch (e) { console.error("Template generation failed:", e); setTplState("error"); setTimeout(() => setTplState(null), 5000); }
+  };
   return (
     <div className="io-toolbar">
-      <button className="io-btn" onClick={() => downloadJournalTemplate(journalKey, data)}><FileDown size={13} /> Download {title} template</button>
+      <button className="io-btn" onClick={handleTemplate} disabled={tplState === "busy"}>
+        <FileDown size={13} /> {tplState === "busy" ? "Building template…" : `Download ${title} template`}
+      </button>
       <button className="io-btn" onClick={importHook.triggerImport}><FileUp size={13} /> Import {title} Excel</button>
       <input ref={importHook.fileInputRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={importHook.handleFileChange} />
+      {tplState === "error" && <span className="io-inline-err">Couldn't build the template — try again.</span>}
+      {p && (
+        <ImportPreviewModal
+          title={gj
+            ? `Review ${p.count} voucher${p.count === 1 ? "" : "s"} (${pvRows.length} line${pvRows.length === 1 ? "" : "s"}) before importing`
+            : `Review ${p.count} row${p.count === 1 ? "" : "s"} before importing`}
+          confirmLabel={gj
+            ? `Confirm import (${p.count} voucher${p.count === 1 ? "" : "s"})`
+            : `Confirm import (${p.count} row${p.count === 1 ? "" : "s"})`}
+          rows={pvRows}
+          columns={previewColumns(journalKey)}
+          onConfirm={importHook.confirmImport}
+          onCancel={importHook.cancelImport}
+        />
+      )}
     </div>
   );
 }
 function ImportStatus({ status }) {
   if (!status) return null;
   return <div className={"import-msg" + (status.type === "error" ? " error" : "")}>{status.text}</div>;
+}
+
+/* ============================== IMPORT REVIEW / PREVIEW ============================== */
+
+// Extra computed columns to show in the preview beyond the template's editable columns, so the
+// user sees the FINAL figures (VAT, EWT/CWT, Net) they'd actually get — not just raw cells.
+const PREVIEW_EXTRA_COLS = {
+  sales: [["outputVat", "Output VAT"], ["total", "Total"]],
+  purchases: [["inputVat", "Input VAT"], ["total", "Total"], ["ewt", "EWT"], ["net", "Net Amount"]],
+  disbursements: [["ewt", "EWT"], ["net", "Net Amount"]],
+  receipts: [["net", "Net Amount"]],
+  form2307: [["atcRate", "Rate"], ["cwt", "CWT"]],
+  employees: [["pGross", "Gross (Present)"], ["totalTaxableComp", "Total Taxable Comp."], ["taxDue", "Tax Due"]],
+  generaljournal: [],
+};
+
+function previewColumns(journalKey) {
+  const base = JOURNAL_SHEETS[journalKey].cols.map((c) => ({ key: c.field, label: c.header }));
+  const extra = (PREVIEW_EXTRA_COLS[journalKey] || []).map(([key, label]) => ({ key, label }));
+  return [...base, ...extra];
+}
+
+// Flattens a parsed import result into the rows the preview table renders. For the general
+// journal that means one row per voucher line; every other journal is already one row per entry.
+function previewRows(journalKey, result) {
+  if (journalKey === "generaljournal") {
+    const out = [];
+    (result.newVouchers || []).forEach((v) => {
+      (v.lines || []).forEach((l) => out.push({ jvNo: v.jvNo, date: v.date, particulars: v.particulars, account: l.account, debit: l.debit, credit: l.credit }));
+    });
+    return out;
+  }
+  return result.newRows || [];
+}
+
+function formatPreviewCell(v) {
+  if (v === null || v === undefined || v === "") return "";
+  if (typeof v === "number") {
+    return Number.isInteger(v) ? String(v) : v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  return String(v);
+}
+
+// Confirmation step shown between "file parsed" and "rows committed to state". Cancelling
+// discards the parsed rows with no state change.
+function ImportPreviewModal({ title, confirmLabel, rows, columns, onConfirm, onCancel }) {
+  const overlay = useOverlayClose(onCancel);
+  return (
+    <div className="modal-overlay" {...overlay}>
+      <div className="modal-box import-preview-box" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h2>{title}</h2>
+          <button className="modal-close" onClick={onCancel}><X size={16} /></button>
+        </div>
+        <div className="modal-body import-preview-body">
+          <p className="import-preview-note">These are the exact values that will be added — including auto-filled lookups (TIN, address, account) and calculated amounts. Nothing is saved until you confirm.</p>
+          <div className="import-preview-scroll">
+            <table className="ledger-table">
+              <thead><tr>{columns.map((c) => <th key={c.key}>{c.label}</th>)}</tr></thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={i}>{columns.map((c) => <td key={c.key}>{formatPreviewCell(r[c.key])}</td>)}</tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn-outline" onClick={onCancel}>Cancel</button>
+          <button className="primary-btn" onClick={onConfirm}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ============================== PDF / A4 EXCEL EXPORT ============================== */
@@ -1513,27 +1731,38 @@ function DelBtn({ onClick }) {
 
 /* ============================== MASTER TABLE (generic) ============================== */
 
-function downloadMasterTemplate(title, columns, rows) {
-  const wb = XLSX.utils.book_new();
-  const instrLines = [
-    [`${title} — Import Template`],
-    [""],
-    ["How to use this file"],
-    [`1. Fill out the "${title}" sheet starting on row 2. Keep the header row and column order as-is.`],
-    ["2. For dropdown-style columns (Type, Account, etc.), type the exact value used in the app."],
-    ["3. For percentage fields, enter the decimal value, e.g. 0.12 for 12%."],
-    [""],
-    ["Importing this file ADDS new rows — it never overwrites or removes what's already in the app."],
-  ];
-  const instrWs = XLSX.utils.aoa_to_sheet(instrLines);
-  instrWs["!cols"] = [{ wch: 100 }];
-  XLSX.utils.book_append_sheet(wb, instrWs, "Instructions");
-  const header = columns.map((c) => c.label);
-  const dataRows = rows.map((r) => columns.map((c) => r[c.key] ?? ""));
-  const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
-  ws["!cols"] = columns.map((c) => ({ wch: Math.max(14, c.label.length + 2) }));
-  XLSX.utils.book_append_sheet(wb, ws, title.slice(0, 31));
-  XLSX.writeFile(wb, `${title.replace(/\s+/g, "-")}-Template.xlsx`);
+async function downloadMasterTemplate(title, columns, rows, data) {
+  const ExcelJS = await loadExcelJS();
+  const dropdownCfg = MASTER_TEMPLATE_DROPDOWNS[title] || {};
+  const wb = new ExcelJS.Workbook();
+
+  const instr = wb.addWorksheet("Instructions");
+  instr.getColumn(1).width = 110;
+  [
+    `${title} — Import Template`,
+    "",
+    "How to use this file",
+    `1. Fill out the "${title}" sheet starting on row 2. Keep the header row and column order as-is.`,
+    "2. Columns with a dropdown arrow accept only values from the list — pick, don't type.",
+    "3. For percentage fields, enter the decimal value, e.g. 0.12 for 12%.",
+    "",
+    "Importing this file ADDS new rows — it never overwrites or removes what's already in the app.",
+  ].forEach((l) => instr.addRow([l]));
+
+  const sheet = wb.addWorksheet(title.slice(0, 31));
+  sheet.columns = columns.map((c) => ({ header: c.label, key: c.key, width: Math.max(14, c.label.length + 2) }));
+  sheet.getRow(1).font = { bold: true };
+  rows.forEach((r) => sheet.addRow(columns.map((c) => r[c.key] ?? "")));
+
+  const refSheets = (data && Object.values(dropdownCfg).some((c) => c.sheet)) ? addTemplateRefSheets(wb, data) : {};
+  const listKeys = [...new Set(Object.values(dropdownCfg).filter((c) => c.list).map((c) => c.list))];
+  const listRanges = addTemplateListsSheet(wb, listKeys);
+
+  const fieldColIndex = {};
+  columns.forEach((c, i) => { fieldColIndex[c.key] = i + 1; });
+  applyTemplateDropdowns(sheet, fieldColIndex, dropdownCfg, refSheets, listRanges, Math.max(rows.length + 1, TEMPLATE_ROW_BUFFER));
+
+  await saveExcelBuffer(wb, `${title.replace(/\s+/g, "-")}-Template.xlsx`);
 }
 
 async function importMasterExcel(title, columns, file) {
@@ -1557,29 +1786,57 @@ async function importMasterExcel(title, columns, file) {
 function useMasterImport(title, columns, onImported) {
   const fileInputRef = useRef(null);
   const [status, setStatus] = useState(null);
+  const [preview, setPreview] = useState(null); // { rows, fileName } — parsed but NOT yet committed
   const triggerImport = () => fileInputRef.current?.click();
+  const flash = (s, ms = 5000) => { setStatus(s); setTimeout(() => setStatus(null), ms); };
   const handleFileChange = async (e) => {
     const file = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!file) return;
     try {
       const newRows = await importMasterExcel(title, columns, file);
-      onImported(newRows);
-      setStatus({ type: "success", text: `Imported ${newRows.length} row${newRows.length === 1 ? "" : "s"} from "${file.name}".` });
+      if (newRows.length === 0) { flash({ type: "error", text: `No data rows found in "${file.name}".` }); return; }
+      setPreview({ rows: newRows, fileName: file.name });
     } catch (err) {
-      setStatus({ type: "error", text: `Couldn't read "${file.name}". Make sure it's an .xlsx file using this table's template with the column order unchanged.` });
+      flash({ type: "error", text: `Couldn't read "${file.name}". Make sure it's an .xlsx file using this table's template with the column order unchanged.` });
     }
-    setTimeout(() => setStatus(null), 5000);
   };
-  return { fileInputRef, status, triggerImport, handleFileChange };
+  const confirmImport = () => {
+    if (!preview) return;
+    onImported(preview.rows);
+    flash({ type: "success", text: `Imported ${preview.rows.length} row${preview.rows.length === 1 ? "" : "s"} from "${preview.fileName}".` });
+    setPreview(null);
+  };
+  const cancelImport = () => setPreview(null);
+  return { fileInputRef, status, triggerImport, handleFileChange, preview, confirmImport, cancelImport };
 }
 
-function MasterImportExportBar({ title, columns, rows, importHook }) {
+function MasterImportExportBar({ title, columns, rows, importHook, data }) {
+  const [tplState, setTplState] = useState(null); // null | "busy" | "error"
+  const p = importHook.preview;
+  const handleTemplate = async () => {
+    setTplState("busy");
+    try { await downloadMasterTemplate(title, columns, rows, data); setTplState(null); }
+    catch (e) { console.error("Template generation failed:", e); setTplState("error"); setTimeout(() => setTplState(null), 5000); }
+  };
   return (
     <div className="io-toolbar">
-      <button className="io-btn" onClick={() => downloadMasterTemplate(title, columns, rows)}><FileDown size={13} /> Download {title} template</button>
+      <button className="io-btn" onClick={handleTemplate} disabled={tplState === "busy"}>
+        <FileDown size={13} /> {tplState === "busy" ? "Building template…" : `Download ${title} template`}
+      </button>
       <button className="io-btn" onClick={importHook.triggerImport}><FileUp size={13} /> Import {title} Excel</button>
       <input ref={importHook.fileInputRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={importHook.handleFileChange} />
+      {tplState === "error" && <span className="io-inline-err">Couldn't build the template — try again.</span>}
+      {p && (
+        <ImportPreviewModal
+          title={`Review ${p.rows.length} row${p.rows.length === 1 ? "" : "s"} before importing`}
+          confirmLabel={`Confirm import (${p.rows.length} row${p.rows.length === 1 ? "" : "s"})`}
+          rows={p.rows}
+          columns={columns.map((c) => ({ key: c.key, label: c.label }))}
+          onConfirm={importHook.confirmImport}
+          onCancel={importHook.cancelImport}
+        />
+      )}
     </div>
   );
 }
@@ -1622,10 +1879,12 @@ function AddRecordModal({ title, columns, initial, onCancel, onSubmit }) {
   );
 }
 
-function MasterTable({ title, columns, rows, onChange, onDelete, addLabel, onCreate, onBulkAdd, initialValues }) {
+function MasterTable({ title, columns, rows, onChange, onDelete, addLabel, onCreate, onBulkAdd, initialValues, data }) {
   const [modalOpen, setModalOpen] = useState(false);
   const [search, setSearch] = useState("");
   const importHook = useMasterImport(title, columns, (newRows) => onBulkAdd(newRows));
+  const sel = useRowSelection();
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const emptyValues = () => {
     const base = Object.fromEntries(columns.map((c) => [c.key, (c.type === "number" || c.type === "percent") ? 0 : ""]));
     return { ...base, ...(initialValues || {}) };
@@ -1636,48 +1895,68 @@ function MasterTable({ title, columns, rows, onChange, onDelete, addLabel, onCre
     const q = search.trim().toLowerCase();
     return rows.filter((row) => columns.some((c) => String(row[c.key] ?? "").toLowerCase().includes(q)));
   }, [rows, search, columns]);
+  const confirmDeleteSelected = () => {
+    // onDelete is a functional setData updater; calling it per id composes correctly into one batched render.
+    [...sel.selected].forEach((id) => onDelete(id));
+    sel.clear();
+    setConfirmDeleteOpen(false);
+  };
   const emptyMsg = rows.length === 0 ? "No entries yet — add your first row above." : "No entries match this search.";
   return (
-    <div className="ledger-wrap">
-      <div className="table-toolbar">
-        <div className="toolbar-left">
-          <MasterImportExportBar title={title} columns={columns} rows={rows} importHook={importHook} />
-          <SearchBar value={search} onChange={setSearch} placeholder={`Search ${title.toLowerCase()}…`} />
+    <>
+      {sel.selected.size > 0 && (
+        <SelectionBar count={sel.selected.size} onClear={sel.clear}>
+          <button className="io-btn danger" onClick={() => setConfirmDeleteOpen(true)}><Trash2 size={13} /> Delete selected</button>
+        </SelectionBar>
+      )}
+      <div className="ledger-wrap">
+        <div className="table-toolbar">
+          <div className="toolbar-left">
+            <MasterImportExportBar title={title} columns={columns} rows={rows} importHook={importHook} data={data} />
+            <SearchBar value={search} onChange={setSearch} placeholder={`Search ${title.toLowerCase()}…`} />
+          </div>
+          <AddRowBtn onClick={() => setModalOpen(true)}>{addLabel || "Add row"}</AddRowBtn>
         </div>
-        <AddRowBtn onClick={() => setModalOpen(true)}>{addLabel || "Add row"}</AddRowBtn>
-      </div>
-      <ImportStatus status={importHook.status} />
-      <div className="table-scroll">
-        <table className="ledger-table">
-          <thead>
-            <tr>
-              {columns.map((c) => <th key={c.key} style={{ minWidth: c.width || 130 }}>{c.label}</th>)}
-              <th style={{ width: 36 }}></th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredRows.length === 0 && (
-              <tr><td colSpan={columns.length + 1} className="empty-row">{emptyMsg}</td></tr>
-            )}
-            {filteredRows.map((row) => (
-              <tr key={row.id}>
-                {columns.map((c) => (
-                  <td key={c.key}>
-                    <Field value={row[c.key]} type={c.type} options={c.options} align={c.align}
-                      onChange={(v) => onChange(row.id, c.key, v)} />
-                  </td>
-                ))}
-                <td className="text-center"><DelBtn onClick={() => onDelete(row.id)} /></td>
+        <ImportStatus status={importHook.status} />
+        <div className="table-scroll">
+          <table className="ledger-table">
+            <thead>
+              <tr>
+                <th style={{ width: 32 }}><SelectAllCheckbox ids={filteredRows.map((r) => r.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
+                {columns.map((c) => <th key={c.key} style={{ minWidth: c.width || 130 }}>{c.label}</th>)}
+                <th style={{ width: 36 }}></th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {filteredRows.length === 0 && (
+                <tr><td colSpan={columns.length + 2} className="empty-row">{emptyMsg}</td></tr>
+              )}
+              {filteredRows.map((row) => (
+                <tr key={row.id} className={sel.selected.has(row.id) ? "row-selected" : ""}>
+                  <td className="text-center"><RowCheckbox id={row.id} selected={sel.selected} toggle={sel.toggle} /></td>
+                  {columns.map((c) => (
+                    <td key={c.key}>
+                      <Field value={row[c.key]} type={c.type} options={c.options} align={c.align}
+                        onChange={(v) => onChange(row.id, c.key, v)} />
+                    </td>
+                  ))}
+                  <td className="text-center"><DelBtn onClick={() => onDelete(row.id)} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
       {modalOpen && (
         <AddRecordModal title={addLabel || "Add record"} columns={columns} initial={emptyValues()}
           onCancel={() => setModalOpen(false)} onSubmit={handleSubmit} />
       )}
-    </div>
+      {confirmDeleteOpen && (
+        <ConfirmModal title="Delete selected" danger confirmLabel="Delete"
+          message={`Delete ${sel.selected.size} selected row${sel.selected.size === 1 ? "" : "s"}? This cannot be undone.`}
+          onCancel={() => setConfirmDeleteOpen(false)} onConfirm={confirmDeleteSelected} />
+      )}
+    </>
   );
 }
 
@@ -2214,7 +2493,7 @@ function CoaPage({ data, setData }) {
   return (
     <div>
       <SectionHeader icon={BookOpenText} title="Chart of Accounts" subtitle="Account codes and names referenced across every journal. Add rows as needed." />
-      <MasterTable title="Chart of Accounts" columns={cols} rows={data.coa} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
+      <MasterTable title="Chart of Accounts" columns={cols} rows={data.coa} data={data} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
         addLabel="Add account" initialValues={{ type: "Expense" }} />
     </div>
   );
@@ -2243,7 +2522,7 @@ function CustomersPage({ data, setData }) {
   return (
     <div>
       <SectionHeader icon={Users} title="Customers Master" subtitle="Add every customer once. The Sales Journal looks up TIN and Address automatically by name." />
-      <MasterTable title="Customers Master" columns={cols} rows={data.customers} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
+      <MasterTable title="Customers Master" columns={cols} rows={data.customers} data={data} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
         addLabel="Add customer" initialValues={{ type: "Non-Individual", account: "SALES", taxCode: 0.12 }} />
     </div>
   );
@@ -2275,7 +2554,7 @@ function SuppliersPage({ data, setData }) {
   return (
     <div>
       <SectionHeader icon={Truck} title="Suppliers Master" subtitle="Add every supplier once. The Purchase Journal looks up TIN, Address, and Description automatically by name." />
-      <MasterTable title="Suppliers Master" columns={cols} rows={data.suppliers} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
+      <MasterTable title="Suppliers Master" columns={cols} rows={data.suppliers} data={data} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
         addLabel="Add supplier" initialValues={{ type: "Non-Individual", taxCode: "VAT" }} />
     </div>
   );
@@ -2299,7 +2578,7 @@ function ItemRecordPage({ data, setData }) {
   return (
     <div>
       <SectionHeader icon={ListChecks} title="Item Record" subtitle="Maps purchase items to a default account. Item Code fields in the Purchase Journal pull directly from here." />
-      <MasterTable title="Item Record" columns={itemCols} rows={data.items} onChange={onItemChange} onCreate={onItemCreate} onBulkAdd={onItemBulkAdd} onDelete={onItemDelete}
+      <MasterTable title="Item Record" columns={itemCols} rows={data.items} data={data} onChange={onItemChange} onCreate={onItemCreate} onBulkAdd={onItemBulkAdd} onDelete={onItemDelete}
         addLabel="Add item" initialValues={{ type: "Services" }} />
     </div>
   );
@@ -2319,7 +2598,7 @@ function AtcReferencePage({ data, setData }) {
   return (
     <div>
       <SectionHeader icon={ListChecks} title="ATC Reference" subtitle="Alphanumeric Tax Code table — the BIR withholding-tax codes used across QAP and SAWT." />
-      <MasterTable title="ATC Reference" columns={atcCols} rows={data.atc} onChange={onAtcChange} onCreate={onAtcCreate} onBulkAdd={onAtcBulkAdd} onDelete={onAtcDelete}
+      <MasterTable title="ATC Reference" columns={atcCols} rows={data.atc} data={data} onChange={onAtcChange} onCreate={onAtcCreate} onBulkAdd={onAtcBulkAdd} onDelete={onAtcDelete}
         addLabel="Add ATC code" />
     </div>
   );
@@ -2340,7 +2619,7 @@ function VatTypesPage({ data, setData }) {
   return (
     <div>
       <SectionHeader icon={Scale} title="VAT Type" subtitle="Edit the names or add rows as needed. Codes are referenced by the journals." />
-      <MasterTable title="VAT Type" columns={cols} rows={data.vatTypes} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
+      <MasterTable title="VAT Type" columns={cols} rows={data.vatTypes} data={data} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
         addLabel="Add VAT type" initialValues={{ books: "Purchase journal" }} />
     </div>
   );
@@ -6952,6 +7231,17 @@ function Style() {
       .combo-empty { padding: 8px 10px; font-size: 12px; color: var(--ink-soft); }
       .import-msg { margin: -10px 0 18px; padding: 9px 14px; border-radius: 8px; background: var(--paper-deep); color: var(--green-deep); font-size: 12.5px; border: 1px solid var(--line); }
       .import-msg.error { background: #FBEAE7; color: var(--red); border-color: #F2CFC9; }
+      .io-inline-err { font-size: 11.5px; color: var(--red); align-self: center; }
+
+      /* Import review / preview modal */
+      .import-preview-box { max-width: min(1120px, 95vw); }
+      .import-preview-body { display: block; padding: 16px 22px 20px; }
+      .import-preview-note { margin: 0 0 12px; font-size: 12px; color: var(--ink-soft); line-height: 1.5; }
+      .import-preview-scroll { overflow: auto; max-height: 60vh; border: 1px solid var(--line); border-radius: 8px; }
+      .import-preview-scroll .ledger-table { width: max-content; min-width: 100%; }
+      .import-preview-scroll .ledger-table th { white-space: nowrap; }
+      .import-preview-scroll .ledger-table td { padding: 6px 10px; white-space: nowrap; font-size: 12px; }
+      .io-btn:disabled { opacity: 0.55; cursor: default; }
 
       .modal-overlay { position: fixed; inset: 0; background: rgba(15,42,77,0.35); display: flex; align-items: center; justify-content: center; z-index: 60; padding: 20px; }
       .modal-box { background: var(--white); border-radius: 12px; max-width: 620px; width: 100%; max-height: 86vh; overflow-y: auto; box-shadow: 0 24px 64px rgba(15,42,77,0.28); }
