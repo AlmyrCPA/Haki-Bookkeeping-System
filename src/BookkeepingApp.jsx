@@ -2739,55 +2739,111 @@ function SalesEntryModal({ data, setData, onCancel, onSubmit }) {
   );
 }
 
+// One transaction, one or more account lines. Shared header fields are entered once; on save the
+// entry is expanded into one stored Purchase Journal row per line (the same one-account-per-row
+// shape as a single manual entry), so every downstream computation, export and report is unchanged.
+const mkPurchaseLine = () => ({ id: uid(), itemCode: "", desc: "", vatType: "", atc: "", atcRate: 0, vatable: 0, nonvat: 0, coaCode: "5001" });
+
 function PurchaseEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), invNo: "", supplier: "", tin: "", address: "", itemCode: "", desc: "", vatType: "", atc: "", atcRate: 0, vatable: 0, nonvat: 0, terms: "Cash", coaCode: "5001", bankAccount: "Cash on Hand" });
-  const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+  const [h, setH] = useState({ date: todayMDY(), invNo: "", supplier: "", tin: "", address: "", terms: "Cash", bankAccount: "Cash on Hand" });
+  const [lines, setLines] = useState([mkPurchaseLine()]);
+  const setHeader = (k, val) => setH((p) => ({ ...p, [k]: val }));
+  const updateLine = (id, patch) => setLines((ls) => ls.map((l) => l.id === id ? { ...l, ...patch } : l));
+  const addLine = () => setLines((ls) => [...ls, mkPurchaseLine()]);
+  const removeLine = (id) => setLines((ls) => ls.length > 1 ? ls.filter((l) => l.id !== id) : ls);
+
   const acctOptions = data.coa.filter((a) => ["Cost of Sales","Expense","Asset"].includes(a.type)).map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const itemOptions = data.items.map((i) => ({ value: i.item, label: i.item }));
   const suppOptions = data.suppliers.map((s) => s.name).filter(Boolean);
-  const vatTypeOptions = data.vatTypes.filter((v) => v.books === "Purchase journal").map((vt) => ({ value: vt.vatType, label: vt.vatType }));
+  const vatTypeOptions = data.vatTypes.filter((vt) => vt.books === "Purchase journal").map((vt) => ({ value: vt.vatType, label: vt.vatType }));
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
   const [quickAdd, setQuickAdd] = useState(null);
-  const onSupplier = (name) => {
+
+  const applySupplier = (name) => {
     const s = data.suppliers.find((x) => x.name.toLowerCase() === (name || "").toLowerCase());
-    if (!s) return setV((p) => ({ ...p, supplier: name }));
+    if (!s) { setHeader("supplier", name); return; }
     const item = data.items.find((i) => i.item === s.itemCode);
-    setV((p) => ({ ...p, supplier: name, tin: s.tin, address: s.address, itemCode: s.itemCode || p.itemCode, desc: item ? item.item : p.desc, coaCode: item ? item.account : p.coaCode }));
+    setH((p) => ({ ...p, supplier: name, tin: s.tin, address: s.address }));
+    // Seed a still-blank first line from the supplier's default item/account.
+    setLines((ls) => ls.map((l, i) => (i === 0 && !l.itemCode && !l.desc && !num(l.vatable) && !num(l.nonvat))
+      ? { ...l, itemCode: s.itemCode || l.itemCode, desc: item ? item.item : l.desc, coaCode: item ? item.account : l.coaCode }
+      : l));
   };
   const onQuickAddSubmit = (supplier) => {
     setData((d) => ({ ...d, suppliers: [...d.suppliers, supplier].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })) }));
-    setV((p) => ({ ...p, supplier: supplier.name, tin: supplier.tin, address: supplier.address }));
+    setH((p) => ({ ...p, supplier: supplier.name, tin: supplier.tin, address: supplier.address }));
     setQuickAdd(null);
   };
-  const onItemCode = (code) => {
+  const onLineItemCode = (id, code) => {
     const item = data.items.find((i) => i.item === code);
-    setV((p) => (item ? { ...p, itemCode: code, desc: item.item, coaCode: item.account } : { ...p, itemCode: code }));
+    updateLine(id, item ? { itemCode: code, desc: item.item, coaCode: item.account } : { itemCode: code });
   };
-  const onAtc = (code) => {
+  const onLineAtc = (id, code) => {
     const atc = data.atc.find((a) => a.code === code);
-    setV((p) => ({ ...p, atc: code, atcRate: atc ? num(atc.rate) : 0 }));
+    updateLine(id, { atc: code, atcRate: atc ? num(atc.rate) : 0 });
   };
-  const computed = computePurchaseRow(v);
+
+  const computedLines = lines.map((l) => computePurchaseRow(l));
+  const totals = computedLines.reduce((a, c) => ({
+    vatable: a.vatable + num(c.vatable), nonvat: a.nonvat + num(c.nonvat), inputVat: a.inputVat + num(c.inputVat),
+    total: a.total + num(c.total), ewt: a.ewt + num(c.ewt), net: a.net + num(c.net),
+  }), { vatable: 0, nonvat: 0, inputVat: 0, total: 0, ewt: 0, net: 0 });
+
+  const handleSubmit = () => {
+    const n = lines.length;
+    const rows = lines.map((l, i) => computePurchaseRow({
+      id: uid(), date: h.date,
+      invNo: n > 1 ? `${h.invNo}${h.invNo ? " " : ""}(${i + 1}/${n})` : h.invNo,
+      supplier: h.supplier, tin: h.tin, address: h.address, terms: h.terms, bankAccount: h.bankAccount,
+      itemCode: l.itemCode, desc: l.desc, vatType: l.vatType, atc: l.atc, atcRate: num(l.atcRate),
+      vatable: num(l.vatable), nonvat: num(l.nonvat), coaCode: l.coaCode,
+    }));
+    onSubmit(rows);
+  };
+
   return (
-    <EntryModalShell title="Add Purchase" submitLabel="Add purchase" onCancel={onCancel}
-      onSubmit={() => onSubmit(computePurchaseRow({ id: uid(), ...v }))}>
-      <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
-      <LabeledField label="Supplier Inv./OR"><Field value={v.invNo} onChange={(x) => set("invNo", x)} /></LabeledField>
-      <LabeledField label="Supplier Name"><Field type="combo" options={suppOptions} value={v.supplier} onChange={onSupplier}
+    <EntryModalShell title="Add Purchase" submitLabel={lines.length > 1 ? `Add ${lines.length} lines` : "Add purchase"} onCancel={onCancel} onSubmit={handleSubmit}>
+      <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
+      <LabeledField label="Supplier Inv./OR"><Field value={h.invNo} onChange={(x) => setHeader("invNo", x)} /></LabeledField>
+      <LabeledField label="Supplier Name"><Field type="combo" options={suppOptions} value={h.supplier} onChange={applySupplier}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="supplier" /></LabeledField>
-      <LabeledField label="TIN"><Field value={v.tin} onChange={(x) => set("tin", x)} /></LabeledField>
-      <LabeledField label="Address" wide><Field value={v.address} onChange={(x) => set("address", x)} /></LabeledField>
-      <LabeledField label="Item Code"><Field type="combo" options={itemOptions} value={v.itemCode} onChange={onItemCode} /></LabeledField>
-      <LabeledField label="Description"><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
-      <LabeledField label="VAT Type" wide><Field type="combo" options={vatTypeOptions} value={v.vatType} onChange={(x) => set("vatType", x)} /></LabeledField>
-      <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={v.atc} onChange={onAtc} /></LabeledField>
-      <LabeledField label="Rate"><ReadCell align="center">{v.atc ? `${round2(v.atcRate * 100)}%` : "—"}</ReadCell></LabeledField>
-      <LabeledField label="VATable"><Field type="number" align="right" value={v.vatable} onChange={(x) => set("vatable", x)} /></LabeledField>
-      <LabeledField label="Non-VAT"><Field type="number" align="right" value={v.nonvat} onChange={(x) => set("nonvat", x)} /></LabeledField>
-      <LabeledField label="Terms"><Field type="select" options={TERMS} value={v.terms} onChange={(x) => set("terms", x)} /></LabeledField>
-      <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
-      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} disabled={v.terms === "Credit"} /></LabeledField>
-      <ComputedPreview items={[["Input VAT", fmt(computed.inputVat)], ["Total", fmt(computed.total)], ["EWT", fmt(computed.ewt)], ["Net Amount", fmt(computed.net)]]} />
+      <LabeledField label="TIN"><Field value={h.tin} onChange={(x) => setHeader("tin", x)} /></LabeledField>
+      <LabeledField label="Address" wide><Field value={h.address} onChange={(x) => setHeader("address", x)} /></LabeledField>
+      <LabeledField label="Terms"><Field type="select" options={TERMS} value={h.terms} onChange={(x) => setHeader("terms", x)} /></LabeledField>
+      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={h.bankAccount} onChange={(x) => setHeader("bankAccount", x)} disabled={h.terms === "Credit"} /></LabeledField>
+
+      <div className="modal-lines">
+        <div className="ml-lines-label">Line items</div>
+        {lines.map((l, i) => {
+          const c = computedLines[i];
+          return (
+            <div key={l.id} className="ml-line-card">
+              <div className="ml-line-head">
+                <span>Line {i + 1}</span>
+                {lines.length > 1 && <button type="button" className="del-btn" onClick={() => removeLine(l.id)}><X size={13} /></button>}
+              </div>
+              <div className="ml-line-grid">
+                <LabeledField label="Item Code"><Field type="combo" options={itemOptions} value={l.itemCode} onChange={(x) => onLineItemCode(l.id, x)} /></LabeledField>
+                <LabeledField label="Description"><Field value={l.desc} onChange={(x) => updateLine(l.id, { desc: x })} /></LabeledField>
+                <LabeledField label="VAT Type" wide><Field type="combo" options={vatTypeOptions} value={l.vatType} onChange={(x) => updateLine(l.id, { vatType: x })} /></LabeledField>
+                <LabeledField label="Account" wide><Field type="combo" options={acctOptions} value={l.coaCode} onChange={(x) => updateLine(l.id, { coaCode: x })} /></LabeledField>
+                <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={l.atc} onChange={(x) => onLineAtc(l.id, x)} /></LabeledField>
+                <LabeledField label="Rate"><ReadCell align="center">{l.atc ? `${round2(num(l.atcRate) * 100)}%` : "—"}</ReadCell></LabeledField>
+                <LabeledField label="VATable"><Field type="number" align="right" value={l.vatable} onChange={(x) => updateLine(l.id, { vatable: x })} /></LabeledField>
+                <LabeledField label="Non-VAT"><Field type="number" align="right" value={l.nonvat} onChange={(x) => updateLine(l.id, { nonvat: x })} /></LabeledField>
+              </div>
+              <div className="ml-line-foot">Input VAT {fmt(c.inputVat)} · Line total {fmt(c.total)} · EWT {fmt(c.ewt)} · Net {fmt(c.net)}</div>
+            </div>
+          );
+        })}
+        <AddRowBtn onClick={addLine}>Add another line</AddRowBtn>
+      </div>
+
+      <ComputedPreview items={[
+        ["Lines", String(lines.length)],
+        ["VATable", fmt(totals.vatable)], ["Non-VAT", fmt(totals.nonvat)], ["Input VAT", fmt(totals.inputVat)],
+        ["Total", fmt(totals.total)], ["EWT", fmt(totals.ewt)], ["Net Amount", fmt(totals.net)],
+      ]} />
       {quickAdd !== null && (
         <QuickAddPartyModal kind="supplier" initialName={quickAdd} onCancel={() => setQuickAdd(null)} onSubmit={onQuickAddSubmit} />
       )}
@@ -2795,46 +2851,88 @@ function PurchaseEntryModal({ data, setData, onCancel, onSubmit }) {
   );
 }
 
+const mkDisbLine = () => ({ id: uid(), desc: "", atc: "", atcRate: 0, amount: 0, coaCode: "6170", appliedToPurchaseId: "" });
+
 function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), tin: "", vendor: "", cvNo: "", desc: "", atc: "", atcRate: 0, amount: 0, bankAccount: "Cash on Hand", coaCode: "6170", appliedToPurchaseId: "" });
-  const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+  const [h, setH] = useState({ date: todayMDY(), tin: "", vendor: "", cvNo: "", bankAccount: "Cash on Hand" });
+  const [lines, setLines] = useState([mkDisbLine()]);
+  const setHeader = (k, val) => setH((p) => ({ ...p, [k]: val }));
+  const updateLine = (id, patch) => setLines((ls) => ls.map((l) => l.id === id ? { ...l, ...patch } : l));
+  const addLine = () => setLines((ls) => [...ls, mkDisbLine()]);
+  const removeLine = (id) => setLines((ls) => ls.length > 1 ? ls.filter((l) => l.id !== id) : ls);
+
   const acctOptions = data.coa.filter((a) => a.type === "Expense" || a.type === "Asset" || a.type === "Liability").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const suppOptions = data.suppliers.map((s) => s.name).filter(Boolean);
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
-  const invoiceOptions = useMemo(() => openInvoiceOptions(AGING_SIDES.AP, data, v.vendor), [data, v.vendor]);
+  const invoiceOptions = useMemo(() => openInvoiceOptions(AGING_SIDES.AP, data, h.vendor), [data, h.vendor]);
   const [quickAdd, setQuickAdd] = useState(null);
-  const onSupplier = (name) => {
+
+  const applySupplier = (name) => {
     const s = data.suppliers.find((x) => x.name.toLowerCase() === (name || "").toLowerCase());
-    setV((p) => ({ ...p, vendor: name, appliedToPurchaseId: "", ...(s ? { tin: s.tin } : {}) }));
+    setH((p) => ({ ...p, vendor: name, ...(s ? { tin: s.tin } : {}) }));
+    setLines((ls) => ls.map((l) => ({ ...l, appliedToPurchaseId: "" })));
   };
   const onQuickAddSubmit = (supplier) => {
     setData((d) => ({ ...d, suppliers: [...d.suppliers, supplier].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })) }));
-    setV((p) => ({ ...p, vendor: supplier.name, tin: supplier.tin }));
+    setH((p) => ({ ...p, vendor: supplier.name, tin: supplier.tin }));
     setQuickAdd(null);
   };
-  const onAtc = (code) => {
+  const onLineAtc = (id, code) => {
     const atc = data.atc.find((a) => a.code === code);
-    setV((p) => ({ ...p, atc: code, atcRate: atc ? num(atc.rate) : 0 }));
+    updateLine(id, { atc: code, atcRate: atc ? num(atc.rate) : 0 });
   };
-  const computed = computeDisbRow(v);
+
+  const computedLines = lines.map((l) => computeDisbRow(l));
+  const totals = computedLines.reduce((a, c) => ({ amount: a.amount + num(c.amount), ewt: a.ewt + num(c.ewt), net: a.net + num(c.net) }), { amount: 0, ewt: 0, net: 0 });
+
+  const handleSubmit = () => {
+    const n = lines.length;
+    const rows = lines.map((l, i) => computeDisbRow({
+      id: uid(), date: h.date, tin: h.tin, vendor: h.vendor, bankAccount: h.bankAccount,
+      cvNo: n > 1 ? `${h.cvNo}${h.cvNo ? " " : ""}(${i + 1}/${n})` : h.cvNo,
+      desc: l.desc, atc: l.atc, atcRate: num(l.atcRate), amount: num(l.amount), coaCode: l.coaCode,
+      appliedToPurchaseId: l.appliedToPurchaseId || "",
+    }));
+    onSubmit(rows);
+  };
+
   return (
-    <EntryModalShell title="Add Disbursement" submitLabel="Add disbursement" onCancel={onCancel}
-      onSubmit={() => onSubmit(computeDisbRow({ id: uid(), ...v }))}>
-      <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
-      <LabeledField label="TIN"><Field value={v.tin} onChange={(x) => set("tin", x)} /></LabeledField>
-      <LabeledField label="Suppliers Name"><Field type="combo" options={suppOptions} value={v.vendor} onChange={onSupplier}
+    <EntryModalShell title="Add Disbursement" submitLabel={lines.length > 1 ? `Add ${lines.length} lines` : "Add disbursement"} onCancel={onCancel} onSubmit={handleSubmit}>
+      <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
+      <LabeledField label="TIN"><Field value={h.tin} onChange={(x) => setHeader("tin", x)} /></LabeledField>
+      <LabeledField label="Suppliers Name"><Field type="combo" options={suppOptions} value={h.vendor} onChange={applySupplier}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="supplier" /></LabeledField>
-      <LabeledField label="Payment Ref."><Field value={v.cvNo} onChange={(x) => set("cvNo", x)} placeholder="CV-001" /></LabeledField>
-      <LabeledField label="Description" wide><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
-      <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={v.atc} onChange={onAtc} /></LabeledField>
-      <LabeledField label="Rate"><ReadCell align="center">{v.atc ? `${round2(v.atcRate * 100)}%` : "—"}</ReadCell></LabeledField>
-      <LabeledField label="Amount"><Field type="number" align="right" value={v.amount} onChange={(x) => set("amount", x)} /></LabeledField>
-      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} /></LabeledField>
-      <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
-      {invoiceOptions.length > 1 && (
-        <LabeledField label="Applied to Invoice" wide><Field type="combo" options={invoiceOptions} value={v.appliedToPurchaseId} onChange={(x) => set("appliedToPurchaseId", x)} /></LabeledField>
-      )}
-      <ComputedPreview items={[["EWT", fmt(computed.ewt)], ["Net Amount", fmt(computed.net)]]} />
+      <LabeledField label="Payment Ref."><Field value={h.cvNo} onChange={(x) => setHeader("cvNo", x)} placeholder="CV-001" /></LabeledField>
+      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={h.bankAccount} onChange={(x) => setHeader("bankAccount", x)} /></LabeledField>
+
+      <div className="modal-lines">
+        <div className="ml-lines-label">Line items</div>
+        {lines.map((l, i) => {
+          const c = computedLines[i];
+          return (
+            <div key={l.id} className="ml-line-card">
+              <div className="ml-line-head">
+                <span>Line {i + 1}</span>
+                {lines.length > 1 && <button type="button" className="del-btn" onClick={() => removeLine(l.id)}><X size={13} /></button>}
+              </div>
+              <div className="ml-line-grid">
+                <LabeledField label="Description" wide><Field value={l.desc} onChange={(x) => updateLine(l.id, { desc: x })} /></LabeledField>
+                <LabeledField label="Account" wide><Field type="combo" options={acctOptions} value={l.coaCode} onChange={(x) => updateLine(l.id, { coaCode: x })} /></LabeledField>
+                <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={l.atc} onChange={(x) => onLineAtc(l.id, x)} /></LabeledField>
+                <LabeledField label="Rate"><ReadCell align="center">{l.atc ? `${round2(num(l.atcRate) * 100)}%` : "—"}</ReadCell></LabeledField>
+                <LabeledField label="Amount"><Field type="number" align="right" value={l.amount} onChange={(x) => updateLine(l.id, { amount: x })} /></LabeledField>
+                {invoiceOptions.length > 1 && (
+                  <LabeledField label="Applied to Invoice" wide><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AP, data, h.vendor, l.appliedToPurchaseId)} value={l.appliedToPurchaseId} onChange={(x) => updateLine(l.id, { appliedToPurchaseId: x })} /></LabeledField>
+                )}
+              </div>
+              <div className="ml-line-foot">EWT {fmt(c.ewt)} · Net {fmt(c.net)}</div>
+            </div>
+          );
+        })}
+        <AddRowBtn onClick={addLine}>Add another line</AddRowBtn>
+      </div>
+
+      <ComputedPreview items={[["Lines", String(lines.length)], ["Amount", fmt(totals.amount)], ["EWT", fmt(totals.ewt)], ["Net Amount", fmt(totals.net)]]} />
       {quickAdd !== null && (
         <QuickAddPartyModal kind="supplier" initialName={quickAdd} onCancel={() => setQuickAdd(null)} onSubmit={onQuickAddSubmit} />
       )}
@@ -3495,7 +3593,7 @@ function PurchasesPage({ data, setData }) {
       </div>
       {modalOpen && (
         <PurchaseEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
-          onSubmit={(row) => { setData((d) => ({ ...d, purchases: [...d.purchases, row] })); setModalOpen(false); }} />
+          onSubmit={(rows) => { setData((d) => ({ ...d, purchases: [...d.purchases, ...rows] })); setModalOpen(false); }} />
       )}
       {quickAddSupplier && (
         <QuickAddPartyModal kind="supplier" initialName={quickAddSupplier.typedName}
@@ -3625,7 +3723,7 @@ function DisbursementsPage({ data, setData }) {
       </div>
       {modalOpen && (
         <DisbEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
-          onSubmit={(row) => { setData((d) => ({ ...d, disbursements: [...d.disbursements, row] })); setModalOpen(false); }} />
+          onSubmit={(rows) => { setData((d) => ({ ...d, disbursements: [...d.disbursements, ...rows] })); setModalOpen(false); }} />
       )}
       {quickAddSupplier && (
         <QuickAddPartyModal kind="supplier" initialName={quickAddSupplier.typedName}
@@ -7562,6 +7660,11 @@ function Style() {
       .computed-preview-item strong { font-family: 'IBM Plex Mono', monospace; color: var(--green-deep); }
       .modal-lines { grid-column: 1 / -1; }
       .modal-lines .ledger-table { margin-bottom: 8px; }
+      .ml-lines-label { font-size: 11.5px; font-weight: 600; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+      .ml-line-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; background: var(--paper-deep); }
+      .ml-line-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 600; color: var(--ink-soft); margin-bottom: 10px; }
+      .ml-line-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+      .ml-line-foot { margin-top: 10px; font-size: 11.5px; color: var(--ink-soft); font-family: 'IBM Plex Mono', monospace; }
 
       .kpi-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 22px; }
       .kpi-card { background: var(--white); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
