@@ -64,6 +64,17 @@ const ITEM_TYPES = ["Services", "Other than Capital Goods", "Capital Goods"];
 const COA_TYPES = ["Asset", "Liability", "Equity", "Revenue", "Cost of Sales", "Expense"];
 const COA_SUBCLASSES = ["Current asset","Non Current Asset","Current Liabilities","Non-current Liabilities","Equity","Revenue","Cost of Goods Sold","Cost of services","Operating expense","Other Income","Other Expense","Income Tax expense"];
 const COA_ACCOUNT_TYPES = ["Bank","Account Receivable","Current asset","Fixed Assets","Non Current Asset","Accounts Payable","Current Liabilities","Non-current Liabilities","Equity","Revenue","Cost of Goods Sold","Cost of services","Operating expense","Other Income","Other Expense","Income Tax expense"];
+// Seed list for the Fixed Asset "Category" combo — free-form, grows via data.assetCategories.
+const ASSET_CATEGORIES = ["Transportation Vehicle","Furniture and Fixtures","Office Equipment","Machinery and Equipment","Building and Improvements","Other"];
+const ASSET_STATUSES = ["Active", "Fully Depreciated", "Disposed"];
+function assetCategoryOptions(data) {
+  const seen = new Set(); const out = [];
+  [...ASSET_CATEGORIES, ...((data && data.assetCategories) || [])].forEach((c) => {
+    const k = String(c || "").trim();
+    if (k && !seen.has(k.toLowerCase())) { seen.add(k.toLowerCase()); out.push(k); }
+  });
+  return out;
+}
 
 const DEFAULT_COA = [
   ["1000","Cash on Hand","Asset","Current asset","Bank",""],
@@ -224,6 +235,8 @@ const NAV = [
     { key: "trial", label: "Trial Balance", icon: ClipboardList },
     { key: "income", label: "Income Statement", icon: TrendingUp },
     { key: "balance", label: "Balance Sheet", icon: Landmark },
+    { key: "apaging", label: "AP Aging", icon: ClipboardList },
+    { key: "araging", label: "AR Aging", icon: ClipboardList },
   ]},
   { group: "Tax Compliance", items: [
     { key: "importation", label: "Importation Ledger", icon: ArrowDownToLine },
@@ -254,6 +267,8 @@ export function makeInitialData() {
     inventoryLog: [], // {id, year, month, beginning, ending}
     importation: [],
     fixedAssets: [],
+    assetCategories: [],        // free-form Fixed Asset categories added by the user
+    ignoredAssetCandidates: [], // source-transaction ids dismissed from the reconciliation notice
     form2307: [],
     employees: [],
   };
@@ -401,19 +416,26 @@ function computeImportationRow(r) {
 }
 
 // Straight-line depreciation, the standard method for simple bookkeeping. Accumulated depreciation
-// reflects what's ACTUALLY been posted to the General Journal (via postedPeriods), not a theoretical
-// time-elapsed calculation — so the ledger always ties out to what's really in the books.
+// is an Opening balance (whatever was already recorded under a prior system before this asset was
+// set up in Haki) plus what's ACTUALLY been posted to the General Journal since (via postedPeriods)
+// — so the ledger ties out to the books while still supporting migrated assets.
 function computeAssetRow(r) {
   const cost = num(r.cost), salvage = num(r.salvageValue), lifeYears = num(r.usefulLifeYears);
   const depreciableBase = Math.max(0, round2(cost - salvage));
   const totalMonths = Math.round(lifeYears * 12);
   const monthlyDep = totalMonths > 0 ? round2(depreciableBase / totalMonths) : 0;
   const postedCount = (r.postedPeriods || []).length;
-  const accumulatedDep = Math.min(depreciableBase, round2(monthlyDep * postedCount));
+  const openingAccumDep = num(r.openingAccumulatedDep);       // recorded before this asset entered Haki
+  const postedDep = round2(monthlyDep * postedCount);          // posted through Haki's own monthly posting
+  const accumulatedDep = Math.min(depreciableBase, round2(openingAccumDep + postedDep));
   const bookValue = round2(cost - accumulatedDep);
   const fullyDepreciated = depreciableBase > 0 && accumulatedDep >= depreciableBase;
   return { ...r, monthlyDep, accumulatedDep, bookValue, fullyDepreciated };
 }
+// The date Haki should start computing NEW monthly depreciation from — same as Acquisition Date for
+// an asset bought after adopting Haki, but different for a migrated asset (the gap is covered by the
+// Opening Accumulated Depreciation).
+const assetDepStartDate = (a) => a.depreciationStartDate || a.acquisitionDate;
 
 /* ============================== EXCEL IMPORT / EXPORT ============================== */
 
@@ -535,6 +557,21 @@ const GJ_COLS = [
   { header: "Debit", field: "debit", type: "number" },
   { header: "Credit", field: "credit", type: "number" },
 ];
+const FIXEDASSET_COLS = [
+  { header: "Asset Name", field: "name" },
+  { header: "Asset Code", field: "code" },
+  { header: "Category", field: "category" },
+  { header: "Acquisition Date (MM/DD/YYYY)", field: "acquisitionDate" },
+  { header: "Depreciation Starting Date (MM/DD/YYYY)", field: "depreciationStartDate" },
+  { header: "Cost", field: "cost", type: "number" },
+  { header: "Salvage Value", field: "salvageValue", type: "number" },
+  { header: "Useful Life (Years)", field: "usefulLifeYears", type: "number" },
+  { header: "Opening Accumulated Depreciation", field: "openingAccumulatedDep", type: "number" },
+  { header: "Asset Account Code", field: "assetAccount" },
+  { header: "Accumulated Depreciation Account Code", field: "accumDepAccount" },
+  { header: "Depreciation Expense Account Code", field: "depExpenseAccount" },
+  { header: "Status (Active/Fully Depreciated/Disposed)", field: "status" },
+];
 
 const JOURNAL_SHEETS = {
   sales: { title: "Sales Journal", cols: SALES_COLS, dataKey: "sales" },
@@ -542,6 +579,7 @@ const JOURNAL_SHEETS = {
   disbursements: { title: "Cash Disbursements", cols: DISB_COLS, dataKey: "disbursements" },
   receipts: { title: "Cash Receipts", cols: RECEIPT_COLS, dataKey: "receipts" },
   generaljournal: { title: "General Journal", cols: GJ_COLS, dataKey: "generalJournal" },
+  fixedassets: { title: "Fixed Asset Ledger", cols: FIXEDASSET_COLS, dataKey: "fixedAssets" },
   form2307: { title: "Creditable Withholding Taxes", cols: FORM2307_COLS, dataKey: "form2307" },
   employees: { title: "Alphalist of Employees", cols: EMPLOYEE_COLS, dataKey: "employees" },
 };
@@ -589,6 +627,7 @@ const TEMPLATE_FIXED_LISTS = {
   "COA Account Type": COA_ACCOUNT_TYPES,
   "VAT Books": VAT_TYPE_BOOKS,
   "SLSPI Field": VAT_TYPE_SLSPI_FIELDS,
+  "Asset Status": ASSET_STATUSES,
 };
 
 // field -> dropdown source. { list: "<key in TEMPLATE_FIXED_LISTS>" } | { sheet, col }
@@ -598,6 +637,7 @@ const JOURNAL_TEMPLATE_DROPDOWNS = {
   disbursements: { vendor: { sheet: "Suppliers Master", col: "B" }, atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
   receipts: { atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
   generaljournal: { account: { sheet: "Chart of Accounts", col: "A" } },
+  fixedassets: { assetAccount: { sheet: "Chart of Accounts", col: "A" }, accumDepAccount: { sheet: "Chart of Accounts", col: "A" }, depExpenseAccount: { sheet: "Chart of Accounts", col: "A" }, status: { list: "Asset Status" } },
   form2307: { atc: { sheet: "ATC Reference", col: "A" } },
   employees: { isMWE: { list: "Yes / No" }, substitutedFiling: { list: "Yes / No" }, empStatus: { list: "Employment Status" }, prevEmpStatus: { list: "Employment Status" } },
 };
@@ -834,6 +874,17 @@ async function importJournalExcel(journalKey, file, data) {
       if (atc) r.atc = atc.code;
       return compute2307Row(r);
     });
+  } else if (journalKey === "fixedassets") {
+    newRows = rawRows.map((r) => {
+      r.acquisitionDate = toMDY(String(r.acquisitionDate ?? "").trim());
+      r.depreciationStartDate = r.depreciationStartDate ? toMDY(String(r.depreciationStartDate).trim()) : "";
+      if (!r.category) r.category = "Other";
+      const st = String(r.status ?? "").trim().toLowerCase();
+      r.status = st.startsWith("dispos") ? "Disposed" : (st.startsWith("full") ? "Fully Depreciated" : "Active");
+      if (!num(r.usefulLifeYears)) r.usefulLifeYears = 5;
+      r.postedPeriods = [];
+      return computeAssetRow(r);
+    });
   } else if (journalKey === "employees") {
     newRows = rawRows.map((r) => {
       if (!r.year) r.year = new Date().getFullYear();
@@ -932,6 +983,7 @@ const PREVIEW_EXTRA_COLS = {
   purchases: [["inputVat", "Input VAT"], ["total", "Total"], ["ewt", "EWT"], ["net", "Net Amount"]],
   disbursements: [["ewt", "EWT"], ["net", "Net Amount"]],
   receipts: [["net", "Net Amount"]],
+  fixedassets: [["monthlyDep", "Monthly Dep."], ["accumulatedDep", "Accum. Dep."], ["bookValue", "Book Value"]],
   form2307: [["atcRate", "Rate"], ["cwt", "CWT"]],
   employees: [["pGross", "Gross (Present)"], ["totalTaxableComp", "Total Taxable Comp."], ["taxDue", "Tax Due"]],
   generaljournal: [],
@@ -1071,6 +1123,14 @@ function buildExportTable(journalKey, rows, coaByCode) {
     const t = rows.reduce((a, r) => ({ gross: a.gross + num(r.pGross), nonTax: a.nonTax + num(r.pTotalNonTax), tax: a.tax + num(r.pTotalTax), taxableComp: a.taxableComp + num(r.totalTaxableComp), due: a.due + num(r.taxDue), wh: a.wh + num(r.taxWithheldPrev) + num(r.taxWithheldPresent) }), { gross: 0, nonTax: 0, tax: 0, taxableComp: 0, due: 0, wh: 0 });
     const totalsRow = ["", "", "", "", "", "TOTALS", fmtPlain(t.gross), fmtPlain(t.nonTax), fmtPlain(t.tax), fmtPlain(t.taxableComp), fmtPlain(t.due), fmtPlain(t.wh)];
     return { headers, body, totalsRow, numericCols: [6,7,8,9,10,11] };
+  }
+  if (journalKey === "fixedassets") {
+    const headers = ["Asset Name","Code","Category","Acquisition Date","Dep. Start Date","Cost","Salvage Value","Life (Yrs)","Opening Accum. Dep.","Monthly Dep.","Accum. Dep.","Book Value","Asset Account","Accum. Dep. Account","Dep. Expense Account","Status"];
+    const rowsC = rows.map((r) => computeAssetRow(r));
+    const body = rowsC.map((r) => [r.name, r.code, r.category, r.acquisitionDate, r.depreciationStartDate || r.acquisitionDate, fmtPlain(r.cost), fmtPlain(r.salvageValue), r.usefulLifeYears, fmtPlain(num(r.openingAccumulatedDep)), fmtPlain(r.monthlyDep), fmtPlain(r.accumulatedDep), fmtPlain(r.bookValue), acctLabel(r.assetAccount), acctLabel(r.accumDepAccount), acctLabel(r.depExpenseAccount), r.status]);
+    const t = rowsC.reduce((a, r) => ({ cost: a.cost + num(r.cost), salvage: a.salvage + num(r.salvageValue), opening: a.opening + num(r.openingAccumulatedDep), monthly: a.monthly + num(r.monthlyDep), accum: a.accum + num(r.accumulatedDep), book: a.book + num(r.bookValue) }), { cost: 0, salvage: 0, opening: 0, monthly: 0, accum: 0, book: 0 });
+    const totalsRow = ["", "", "", "", "TOTALS", fmtPlain(t.cost), fmtPlain(t.salvage), "", fmtPlain(t.opening), fmtPlain(t.monthly), fmtPlain(t.accum), fmtPlain(t.book), "", "", "", ""];
+    return { headers, body, totalsRow, numericCols: [5, 6, 8, 9, 10, 11] };
   }
   if (journalKey === "generaljournal") {
     const headers = ["JV No.","Date","Particulars","Account","Debit","Credit"];
@@ -2145,6 +2205,8 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
           {page === "trial" && <TrialBalancePage data={data} postings={postings} coaMap={coaMap} />}
           {page === "income" && <IncomeStatementPage data={data} setData={setData} postings={postings} coaMap={coaMap} />}
           {page === "balance" && <BalanceSheetPage data={data} postings={postings} coaMap={coaMap} />}
+          {page === "apaging" && <AgingReportPage data={data} side="AP" />}
+          {page === "araging" && <AgingReportPage data={data} side="AR" />}
           {page === "importation" && <ImportationLedgerPage data={data} setData={setData} />}
           {page === "slspi" && <SLSPIPage data={data} />}
           {page === "qap" && <QAPPage data={data} />}
@@ -2735,55 +2797,111 @@ function SalesEntryModal({ data, setData, onCancel, onSubmit }) {
   );
 }
 
+// One transaction, one or more account lines. Shared header fields are entered once; on save the
+// entry is expanded into one stored Purchase Journal row per line (the same one-account-per-row
+// shape as a single manual entry), so every downstream computation, export and report is unchanged.
+const mkPurchaseLine = () => ({ id: uid(), itemCode: "", desc: "", vatType: "", atc: "", atcRate: 0, vatable: 0, nonvat: 0, coaCode: "5001" });
+
 function PurchaseEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), invNo: "", supplier: "", tin: "", address: "", itemCode: "", desc: "", vatType: "", atc: "", atcRate: 0, vatable: 0, nonvat: 0, terms: "Cash", coaCode: "5001", bankAccount: "Cash on Hand" });
-  const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+  const [h, setH] = useState({ date: todayMDY(), invNo: "", supplier: "", tin: "", address: "", terms: "Cash", bankAccount: "Cash on Hand" });
+  const [lines, setLines] = useState([mkPurchaseLine()]);
+  const setHeader = (k, val) => setH((p) => ({ ...p, [k]: val }));
+  const updateLine = (id, patch) => setLines((ls) => ls.map((l) => l.id === id ? { ...l, ...patch } : l));
+  const addLine = () => setLines((ls) => [...ls, mkPurchaseLine()]);
+  const removeLine = (id) => setLines((ls) => ls.length > 1 ? ls.filter((l) => l.id !== id) : ls);
+
   const acctOptions = data.coa.filter((a) => ["Cost of Sales","Expense","Asset"].includes(a.type)).map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const itemOptions = data.items.map((i) => ({ value: i.item, label: i.item }));
   const suppOptions = data.suppliers.map((s) => s.name).filter(Boolean);
-  const vatTypeOptions = data.vatTypes.filter((v) => v.books === "Purchase journal").map((vt) => ({ value: vt.vatType, label: vt.vatType }));
+  const vatTypeOptions = data.vatTypes.filter((vt) => vt.books === "Purchase journal").map((vt) => ({ value: vt.vatType, label: vt.vatType }));
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
   const [quickAdd, setQuickAdd] = useState(null);
-  const onSupplier = (name) => {
+
+  const applySupplier = (name) => {
     const s = data.suppliers.find((x) => x.name.toLowerCase() === (name || "").toLowerCase());
-    if (!s) return setV((p) => ({ ...p, supplier: name }));
+    if (!s) { setHeader("supplier", name); return; }
     const item = data.items.find((i) => i.item === s.itemCode);
-    setV((p) => ({ ...p, supplier: name, tin: s.tin, address: s.address, itemCode: s.itemCode || p.itemCode, desc: item ? item.item : p.desc, coaCode: item ? item.account : p.coaCode }));
+    setH((p) => ({ ...p, supplier: name, tin: s.tin, address: s.address }));
+    // Seed a still-blank first line from the supplier's default item/account.
+    setLines((ls) => ls.map((l, i) => (i === 0 && !l.itemCode && !l.desc && !num(l.vatable) && !num(l.nonvat))
+      ? { ...l, itemCode: s.itemCode || l.itemCode, desc: item ? item.item : l.desc, coaCode: item ? item.account : l.coaCode }
+      : l));
   };
   const onQuickAddSubmit = (supplier) => {
     setData((d) => ({ ...d, suppliers: [...d.suppliers, supplier].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })) }));
-    setV((p) => ({ ...p, supplier: supplier.name, tin: supplier.tin, address: supplier.address }));
+    setH((p) => ({ ...p, supplier: supplier.name, tin: supplier.tin, address: supplier.address }));
     setQuickAdd(null);
   };
-  const onItemCode = (code) => {
+  const onLineItemCode = (id, code) => {
     const item = data.items.find((i) => i.item === code);
-    setV((p) => (item ? { ...p, itemCode: code, desc: item.item, coaCode: item.account } : { ...p, itemCode: code }));
+    updateLine(id, item ? { itemCode: code, desc: item.item, coaCode: item.account } : { itemCode: code });
   };
-  const onAtc = (code) => {
+  const onLineAtc = (id, code) => {
     const atc = data.atc.find((a) => a.code === code);
-    setV((p) => ({ ...p, atc: code, atcRate: atc ? num(atc.rate) : 0 }));
+    updateLine(id, { atc: code, atcRate: atc ? num(atc.rate) : 0 });
   };
-  const computed = computePurchaseRow(v);
+
+  const computedLines = lines.map((l) => computePurchaseRow(l));
+  const totals = computedLines.reduce((a, c) => ({
+    vatable: a.vatable + num(c.vatable), nonvat: a.nonvat + num(c.nonvat), inputVat: a.inputVat + num(c.inputVat),
+    total: a.total + num(c.total), ewt: a.ewt + num(c.ewt), net: a.net + num(c.net),
+  }), { vatable: 0, nonvat: 0, inputVat: 0, total: 0, ewt: 0, net: 0 });
+
+  const handleSubmit = () => {
+    const n = lines.length;
+    const rows = lines.map((l, i) => computePurchaseRow({
+      id: uid(), date: h.date,
+      invNo: n > 1 ? `${h.invNo}${h.invNo ? " " : ""}(${i + 1}/${n})` : h.invNo,
+      supplier: h.supplier, tin: h.tin, address: h.address, terms: h.terms, bankAccount: h.bankAccount,
+      itemCode: l.itemCode, desc: l.desc, vatType: l.vatType, atc: l.atc, atcRate: num(l.atcRate),
+      vatable: num(l.vatable), nonvat: num(l.nonvat), coaCode: l.coaCode,
+    }));
+    onSubmit(rows);
+  };
+
   return (
-    <EntryModalShell title="Add Purchase" submitLabel="Add purchase" onCancel={onCancel}
-      onSubmit={() => onSubmit(computePurchaseRow({ id: uid(), ...v }))}>
-      <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
-      <LabeledField label="Supplier Inv./OR"><Field value={v.invNo} onChange={(x) => set("invNo", x)} /></LabeledField>
-      <LabeledField label="Supplier Name"><Field type="combo" options={suppOptions} value={v.supplier} onChange={onSupplier}
+    <EntryModalShell title="Add Purchase" submitLabel={lines.length > 1 ? `Add ${lines.length} lines` : "Add purchase"} onCancel={onCancel} onSubmit={handleSubmit}>
+      <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
+      <LabeledField label="Supplier Inv./OR"><Field value={h.invNo} onChange={(x) => setHeader("invNo", x)} /></LabeledField>
+      <LabeledField label="Supplier Name"><Field type="combo" options={suppOptions} value={h.supplier} onChange={applySupplier}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="supplier" /></LabeledField>
-      <LabeledField label="TIN"><Field value={v.tin} onChange={(x) => set("tin", x)} /></LabeledField>
-      <LabeledField label="Address" wide><Field value={v.address} onChange={(x) => set("address", x)} /></LabeledField>
-      <LabeledField label="Item Code"><Field type="combo" options={itemOptions} value={v.itemCode} onChange={onItemCode} /></LabeledField>
-      <LabeledField label="Description"><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
-      <LabeledField label="VAT Type" wide><Field type="combo" options={vatTypeOptions} value={v.vatType} onChange={(x) => set("vatType", x)} /></LabeledField>
-      <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={v.atc} onChange={onAtc} /></LabeledField>
-      <LabeledField label="Rate"><ReadCell align="center">{v.atc ? `${round2(v.atcRate * 100)}%` : "—"}</ReadCell></LabeledField>
-      <LabeledField label="VATable"><Field type="number" align="right" value={v.vatable} onChange={(x) => set("vatable", x)} /></LabeledField>
-      <LabeledField label="Non-VAT"><Field type="number" align="right" value={v.nonvat} onChange={(x) => set("nonvat", x)} /></LabeledField>
-      <LabeledField label="Terms"><Field type="select" options={TERMS} value={v.terms} onChange={(x) => set("terms", x)} /></LabeledField>
-      <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
-      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} disabled={v.terms === "Credit"} /></LabeledField>
-      <ComputedPreview items={[["Input VAT", fmt(computed.inputVat)], ["Total", fmt(computed.total)], ["EWT", fmt(computed.ewt)], ["Net Amount", fmt(computed.net)]]} />
+      <LabeledField label="TIN"><Field value={h.tin} onChange={(x) => setHeader("tin", x)} /></LabeledField>
+      <LabeledField label="Address" wide><Field value={h.address} onChange={(x) => setHeader("address", x)} /></LabeledField>
+      <LabeledField label="Terms"><Field type="select" options={TERMS} value={h.terms} onChange={(x) => setHeader("terms", x)} /></LabeledField>
+      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={h.bankAccount} onChange={(x) => setHeader("bankAccount", x)} disabled={h.terms === "Credit"} /></LabeledField>
+
+      <div className="modal-lines">
+        <div className="ml-lines-label">Line items</div>
+        {lines.map((l, i) => {
+          const c = computedLines[i];
+          return (
+            <div key={l.id} className="ml-line-card">
+              <div className="ml-line-head">
+                <span>Line {i + 1}</span>
+                {lines.length > 1 && <button type="button" className="del-btn" onClick={() => removeLine(l.id)}><X size={13} /></button>}
+              </div>
+              <div className="ml-line-grid">
+                <LabeledField label="Item Code"><Field type="combo" options={itemOptions} value={l.itemCode} onChange={(x) => onLineItemCode(l.id, x)} /></LabeledField>
+                <LabeledField label="Description"><Field value={l.desc} onChange={(x) => updateLine(l.id, { desc: x })} /></LabeledField>
+                <LabeledField label="VAT Type" wide><Field type="combo" options={vatTypeOptions} value={l.vatType} onChange={(x) => updateLine(l.id, { vatType: x })} /></LabeledField>
+                <LabeledField label="Account" wide><Field type="combo" options={acctOptions} value={l.coaCode} onChange={(x) => updateLine(l.id, { coaCode: x })} /></LabeledField>
+                <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={l.atc} onChange={(x) => onLineAtc(l.id, x)} /></LabeledField>
+                <LabeledField label="Rate"><ReadCell align="center">{l.atc ? `${round2(num(l.atcRate) * 100)}%` : "—"}</ReadCell></LabeledField>
+                <LabeledField label="VATable"><Field type="number" align="right" value={l.vatable} onChange={(x) => updateLine(l.id, { vatable: x })} /></LabeledField>
+                <LabeledField label="Non-VAT"><Field type="number" align="right" value={l.nonvat} onChange={(x) => updateLine(l.id, { nonvat: x })} /></LabeledField>
+              </div>
+              <div className="ml-line-foot">Input VAT {fmt(c.inputVat)} · Line total {fmt(c.total)} · EWT {fmt(c.ewt)} · Net {fmt(c.net)}</div>
+            </div>
+          );
+        })}
+        <AddRowBtn onClick={addLine}>Add another line</AddRowBtn>
+      </div>
+
+      <ComputedPreview items={[
+        ["Lines", String(lines.length)],
+        ["VATable", fmt(totals.vatable)], ["Non-VAT", fmt(totals.nonvat)], ["Input VAT", fmt(totals.inputVat)],
+        ["Total", fmt(totals.total)], ["EWT", fmt(totals.ewt)], ["Net Amount", fmt(totals.net)],
+      ]} />
       {quickAdd !== null && (
         <QuickAddPartyModal kind="supplier" initialName={quickAdd} onCancel={() => setQuickAdd(null)} onSubmit={onQuickAddSubmit} />
       )}
@@ -2791,42 +2909,88 @@ function PurchaseEntryModal({ data, setData, onCancel, onSubmit }) {
   );
 }
 
+const mkDisbLine = () => ({ id: uid(), desc: "", atc: "", atcRate: 0, amount: 0, coaCode: "6170", appliedToPurchaseId: "" });
+
 function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), tin: "", vendor: "", cvNo: "", desc: "", atc: "", atcRate: 0, amount: 0, bankAccount: "Cash on Hand", coaCode: "6170" });
-  const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+  const [h, setH] = useState({ date: todayMDY(), tin: "", vendor: "", cvNo: "", bankAccount: "Cash on Hand" });
+  const [lines, setLines] = useState([mkDisbLine()]);
+  const setHeader = (k, val) => setH((p) => ({ ...p, [k]: val }));
+  const updateLine = (id, patch) => setLines((ls) => ls.map((l) => l.id === id ? { ...l, ...patch } : l));
+  const addLine = () => setLines((ls) => [...ls, mkDisbLine()]);
+  const removeLine = (id) => setLines((ls) => ls.length > 1 ? ls.filter((l) => l.id !== id) : ls);
+
   const acctOptions = data.coa.filter((a) => a.type === "Expense" || a.type === "Asset" || a.type === "Liability").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const suppOptions = data.suppliers.map((s) => s.name).filter(Boolean);
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
+  const invoiceOptions = useMemo(() => openInvoiceOptions(AGING_SIDES.AP, data, h.vendor), [data, h.vendor]);
   const [quickAdd, setQuickAdd] = useState(null);
-  const onSupplier = (name) => {
+
+  const applySupplier = (name) => {
     const s = data.suppliers.find((x) => x.name.toLowerCase() === (name || "").toLowerCase());
-    setV((p) => ({ ...p, vendor: name, ...(s ? { tin: s.tin } : {}) }));
+    setH((p) => ({ ...p, vendor: name, ...(s ? { tin: s.tin } : {}) }));
+    setLines((ls) => ls.map((l) => ({ ...l, appliedToPurchaseId: "" })));
   };
   const onQuickAddSubmit = (supplier) => {
     setData((d) => ({ ...d, suppliers: [...d.suppliers, supplier].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })) }));
-    setV((p) => ({ ...p, vendor: supplier.name, tin: supplier.tin }));
+    setH((p) => ({ ...p, vendor: supplier.name, tin: supplier.tin }));
     setQuickAdd(null);
   };
-  const onAtc = (code) => {
+  const onLineAtc = (id, code) => {
     const atc = data.atc.find((a) => a.code === code);
-    setV((p) => ({ ...p, atc: code, atcRate: atc ? num(atc.rate) : 0 }));
+    updateLine(id, { atc: code, atcRate: atc ? num(atc.rate) : 0 });
   };
-  const computed = computeDisbRow(v);
+
+  const computedLines = lines.map((l) => computeDisbRow(l));
+  const totals = computedLines.reduce((a, c) => ({ amount: a.amount + num(c.amount), ewt: a.ewt + num(c.ewt), net: a.net + num(c.net) }), { amount: 0, ewt: 0, net: 0 });
+
+  const handleSubmit = () => {
+    const n = lines.length;
+    const rows = lines.map((l, i) => computeDisbRow({
+      id: uid(), date: h.date, tin: h.tin, vendor: h.vendor, bankAccount: h.bankAccount,
+      cvNo: n > 1 ? `${h.cvNo}${h.cvNo ? " " : ""}(${i + 1}/${n})` : h.cvNo,
+      desc: l.desc, atc: l.atc, atcRate: num(l.atcRate), amount: num(l.amount), coaCode: l.coaCode,
+      appliedToPurchaseId: l.appliedToPurchaseId || "",
+    }));
+    onSubmit(rows);
+  };
+
   return (
-    <EntryModalShell title="Add Disbursement" submitLabel="Add disbursement" onCancel={onCancel}
-      onSubmit={() => onSubmit(computeDisbRow({ id: uid(), ...v }))}>
-      <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
-      <LabeledField label="TIN"><Field value={v.tin} onChange={(x) => set("tin", x)} /></LabeledField>
-      <LabeledField label="Suppliers Name"><Field type="combo" options={suppOptions} value={v.vendor} onChange={onSupplier}
+    <EntryModalShell title="Add Disbursement" submitLabel={lines.length > 1 ? `Add ${lines.length} lines` : "Add disbursement"} onCancel={onCancel} onSubmit={handleSubmit}>
+      <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
+      <LabeledField label="TIN"><Field value={h.tin} onChange={(x) => setHeader("tin", x)} /></LabeledField>
+      <LabeledField label="Suppliers Name"><Field type="combo" options={suppOptions} value={h.vendor} onChange={applySupplier}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="supplier" /></LabeledField>
-      <LabeledField label="Payment Ref."><Field value={v.cvNo} onChange={(x) => set("cvNo", x)} placeholder="CV-001" /></LabeledField>
-      <LabeledField label="Description" wide><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
-      <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={v.atc} onChange={onAtc} /></LabeledField>
-      <LabeledField label="Rate"><ReadCell align="center">{v.atc ? `${round2(v.atcRate * 100)}%` : "—"}</ReadCell></LabeledField>
-      <LabeledField label="Amount"><Field type="number" align="right" value={v.amount} onChange={(x) => set("amount", x)} /></LabeledField>
-      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} /></LabeledField>
-      <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
-      <ComputedPreview items={[["EWT", fmt(computed.ewt)], ["Net Amount", fmt(computed.net)]]} />
+      <LabeledField label="Payment Ref."><Field value={h.cvNo} onChange={(x) => setHeader("cvNo", x)} placeholder="CV-001" /></LabeledField>
+      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={h.bankAccount} onChange={(x) => setHeader("bankAccount", x)} /></LabeledField>
+
+      <div className="modal-lines">
+        <div className="ml-lines-label">Line items</div>
+        {lines.map((l, i) => {
+          const c = computedLines[i];
+          return (
+            <div key={l.id} className="ml-line-card">
+              <div className="ml-line-head">
+                <span>Line {i + 1}</span>
+                {lines.length > 1 && <button type="button" className="del-btn" onClick={() => removeLine(l.id)}><X size={13} /></button>}
+              </div>
+              <div className="ml-line-grid">
+                <LabeledField label="Description" wide><Field value={l.desc} onChange={(x) => updateLine(l.id, { desc: x })} /></LabeledField>
+                <LabeledField label="Account" wide><Field type="combo" options={acctOptions} value={l.coaCode} onChange={(x) => updateLine(l.id, { coaCode: x })} /></LabeledField>
+                <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={l.atc} onChange={(x) => onLineAtc(l.id, x)} /></LabeledField>
+                <LabeledField label="Rate"><ReadCell align="center">{l.atc ? `${round2(num(l.atcRate) * 100)}%` : "—"}</ReadCell></LabeledField>
+                <LabeledField label="Amount"><Field type="number" align="right" value={l.amount} onChange={(x) => updateLine(l.id, { amount: x })} /></LabeledField>
+                {invoiceOptions.length > 1 && (
+                  <LabeledField label="Applied to Invoice" wide><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AP, data, h.vendor, l.appliedToPurchaseId)} value={l.appliedToPurchaseId} onChange={(x) => updateLine(l.id, { appliedToPurchaseId: x })} /></LabeledField>
+                )}
+              </div>
+              <div className="ml-line-foot">EWT {fmt(c.ewt)} · Net {fmt(c.net)}</div>
+            </div>
+          );
+        })}
+        <AddRowBtn onClick={addLine}>Add another line</AddRowBtn>
+      </div>
+
+      <ComputedPreview items={[["Lines", String(lines.length)], ["Amount", fmt(totals.amount)], ["EWT", fmt(totals.ewt)], ["Net Amount", fmt(totals.net)]]} />
       {quickAdd !== null && (
         <QuickAddPartyModal kind="supplier" initialName={quickAdd} onCancel={() => setQuickAdd(null)} onSubmit={onQuickAddSubmit} />
       )}
@@ -2835,10 +2999,11 @@ function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
 }
 
 function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), from: "", orNo: "", desc: "", atc: "", atcRate: 0, amount: 0, cwt: 0, bankAccount: "Cash on Hand", coaCode: "1200" });
+  const [v, setV] = useState({ date: todayMDY(), from: "", orNo: "", desc: "", atc: "", atcRate: 0, amount: 0, cwt: 0, bankAccount: "Cash on Hand", coaCode: "1200", appliedToSalesId: "" });
   const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
   const acctOptions = data.coa.map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const custOptions = data.customers.map((c) => c.name).filter(Boolean);
+  const invoiceOptions = useMemo(() => openInvoiceOptions(AGING_SIDES.AR, data, v.from), [data, v.from]);
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
   const [quickAdd, setQuickAdd] = useState(null);
   const onQuickAddSubmit = (customer) => {
@@ -2859,7 +3024,7 @@ function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
     <EntryModalShell title="Add Receipt" submitLabel="Add receipt" onCancel={onCancel}
       onSubmit={() => onSubmit(computeReceiptRow({ id: uid(), ...v }))}>
       <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
-      <LabeledField label="Received From"><Field type="combo" options={custOptions} value={v.from} onChange={(x) => set("from", x)}
+      <LabeledField label="Received From"><Field type="combo" options={custOptions} value={v.from} onChange={(x) => setV((p) => ({ ...p, from: x, appliedToSalesId: "" }))}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="customer" /></LabeledField>
       <LabeledField label="OR/Ref No."><Field value={v.orNo} onChange={(x) => set("orNo", x)} placeholder="OR-001" /></LabeledField>
       <LabeledField label="Description" wide><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
@@ -2869,6 +3034,9 @@ function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
       <LabeledField label="CWT"><Field type="number" align="right" value={v.cwt} onChange={(x) => set("cwt", x)} /></LabeledField>
       <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} /></LabeledField>
       <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
+      {invoiceOptions.length > 1 && (
+        <LabeledField label="Applied to Invoice" wide><Field type="combo" options={invoiceOptions} value={v.appliedToSalesId} onChange={(x) => set("appliedToSalesId", x)} /></LabeledField>
+      )}
       <ComputedPreview items={[["Net Amount", fmt(computed.net)]]} />
       <div className="qf-hint">CWT auto-fills from ATC × Amount, but stays fully editable — type over it (formulas work too) for non-VAT books or special cases.</div>
       {quickAdd !== null && (
@@ -2878,10 +3046,32 @@ function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
   );
 }
 
+// Default JV No. format: JV-YYYY-001, where YYYY is the year of the entry's own Date and the
+// trailing number is a chronological sequence within that year (one past the highest already used).
+// This is a suggestion only — the field stays editable.
+function suggestNextJvNo(generalJournal, dateStr) {
+  const d = parseAppDate(dateStr);
+  const year = d ? d.getFullYear() : new Date().getFullYear();
+  const prefix = `JV-${year}-`;
+  const existingSeqs = (generalJournal || [])
+    .filter((jv) => (jv.jvNo || "").startsWith(prefix))
+    .map((jv) => parseInt(jv.jvNo.slice(prefix.length), 10))
+    .filter((n) => !isNaN(n));
+  const next = existingSeqs.length ? Math.max(...existingSeqs) + 1 : 1;
+  return `${prefix}${String(next).padStart(3, "0")}`;
+}
+
 function JournalVoucherModal({ data, onCancel, onSubmit, nextJvNo, initial, title, submitLabel }) {
   const acctOptions = data.coa.map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
-  const [jvNo, setJvNo] = useState(initial?.jvNo || nextJvNo);
   const [date, setDate] = useState(initial?.date || todayMDY());
+  const [jvNo, setJvNo] = useState(initial?.jvNo || nextJvNo || suggestNextJvNo(data.generalJournal, initial?.date || todayMDY()));
+  // Auto-fill the JV No. from the entry's date until the user types over it directly. Once they've
+  // edited the field, stop re-suggesting so an externally-assigned number isn't clobbered.
+  const [jvNoTouched, setJvNoTouched] = useState(false);
+  useEffect(() => {
+    if (jvNoTouched || initial?.jvNo) return;
+    setJvNo(suggestNextJvNo(data.generalJournal, date));
+  }, [date, jvNoTouched]); // eslint-disable-line react-hooks/exhaustive-deps
   const [particulars, setParticulars] = useState(initial?.particulars || "");
   const [lines, setLines] = useState(
     initial?.lines && initial.lines.length
@@ -2897,7 +3087,7 @@ function JournalVoucherModal({ data, onCancel, onSubmit, nextJvNo, initial, titl
   return (
     <EntryModalShell title={title || "Add Journal Voucher"} submitLabel={submitLabel || "Add voucher"} onCancel={onCancel}
       onSubmit={() => onSubmit({ id: uid(), jvNo, date, particulars, lines: lines.map((l) => ({ id: uid(), account: l.account, debit: num(l.debit), credit: num(l.credit) })) })}>
-      <LabeledField label="JV No."><Field value={jvNo} onChange={setJvNo} placeholder="JV-001" /></LabeledField>
+      <LabeledField label="JV No."><Field value={jvNo} onChange={(v) => { setJvNo(v); setJvNoTouched(true); }} placeholder="JV-2026-001" /></LabeledField>
       <LabeledField label="Date"><Field type="date" value={date} onChange={setDate} /></LabeledField>
       <LabeledField label="Particulars" wide><Field value={particulars} onChange={setParticulars} placeholder="Particulars / description of entry" /></LabeledField>
       <div className="modal-lines">
@@ -3461,7 +3651,7 @@ function PurchasesPage({ data, setData }) {
       </div>
       {modalOpen && (
         <PurchaseEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
-          onSubmit={(row) => { setData((d) => ({ ...d, purchases: [...d.purchases, row] })); setModalOpen(false); }} />
+          onSubmit={(rows) => { setData((d) => ({ ...d, purchases: [...d.purchases, ...rows] })); setModalOpen(false); }} />
       )}
       {quickAddSupplier && (
         <QuickAddPartyModal kind="supplier" initialName={quickAddSupplier.typedName}
@@ -3554,10 +3744,11 @@ function DisbursementsPage({ data, setData }) {
               <th style={{minWidth:200}}>Description</th><th style={{minWidth:180}}>ATC</th><th style={{minWidth:80}} className="num-head">Rate</th>
               <th style={{minWidth:110}} className="num-head">Amount</th>
               <th style={{minWidth:100}} className="num-head">EWT</th><th style={{minWidth:110}} className="num-head">Net Amount</th>
-              <th style={{minWidth:130}}>Bank Account</th><th style={{minWidth:190}}>Account</th><th style={{width:36}}></th>
+              <th style={{minWidth:130}}>Bank Account</th><th style={{minWidth:190}}>Account</th>
+              <th style={{minWidth:230}}>Applied to Invoice</th><th style={{width:36}}></th>
             </tr></thead>
             <tbody>
-              {filteredRows.length === 0 && <tr><td colSpan={14} className="empty-row">{emptyMsg}</td></tr>}
+              {filteredRows.length === 0 && <tr><td colSpan={15} className="empty-row">{emptyMsg}</td></tr>}
               {pg.pageRows.map((r) => (
                 <tr key={r.id} className={sel.selected.has(r.id) ? "row-selected" : ""}>
                   <td className="text-center"><RowCheckbox id={r.id} selected={sel.selected} toggle={sel.toggle} /></td>
@@ -3574,13 +3765,14 @@ function DisbursementsPage({ data, setData }) {
                   <td><ReadCell align="right">{fmt(r.net)}</ReadCell></td>
                   <td><Field type="select" options={BANK_ACCOUNTS} value={r.bankAccount} onChange={(v) => update(r.id, { bankAccount: v })} /></td>
                   <td><Field type="combo" options={acctOptions} value={r.coaCode} onChange={(v) => update(r.id, { coaCode: v })} /></td>
+                  <td><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AP, data, r.vendor, r.appliedToPurchaseId)} value={r.appliedToPurchaseId || ""} onChange={(v) => update(r.id, { appliedToPurchaseId: v })} /></td>
                   <td className="text-center"><DelBtn onClick={() => onDelete(r.id)} /></td>
                 </tr>
               ))}
             </tbody>
             {filteredRows.length > 0 && (
               <tfoot><tr><td colSpan={8} className="totals-label">Totals</td>
-                <td className="num">{fmt(totals.amount)}</td><td className="num">{fmt(totals.ewt)}</td><td className="num">{fmt(totals.net)}</td><td colSpan={3}></td>
+                <td className="num">{fmt(totals.amount)}</td><td className="num">{fmt(totals.ewt)}</td><td className="num">{fmt(totals.net)}</td><td colSpan={4}></td>
               </tr></tfoot>
             )}
           </table>
@@ -3589,7 +3781,7 @@ function DisbursementsPage({ data, setData }) {
       </div>
       {modalOpen && (
         <DisbEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
-          onSubmit={(row) => { setData((d) => ({ ...d, disbursements: [...d.disbursements, row] })); setModalOpen(false); }} />
+          onSubmit={(rows) => { setData((d) => ({ ...d, disbursements: [...d.disbursements, ...rows] })); setModalOpen(false); }} />
       )}
       {quickAddSupplier && (
         <QuickAddPartyModal kind="supplier" initialName={quickAddSupplier.typedName}
@@ -3679,15 +3871,16 @@ function ReceiptsPage({ data, setData }) {
               <th style={{minWidth:200}}>Description</th><th style={{minWidth:180}}>ATC</th><th style={{minWidth:80}} className="num-head">Rate</th>
               <th style={{minWidth:110}} className="num-head">Amount</th>
               <th style={{minWidth:100}} className="num-head">CWT</th><th style={{minWidth:110}} className="num-head">Net Amount</th>
-              <th style={{minWidth:130}}>Bank Account</th><th style={{minWidth:190}}>Account</th><th style={{width:36}}></th>
+              <th style={{minWidth:130}}>Bank Account</th><th style={{minWidth:190}}>Account</th>
+              <th style={{minWidth:230}}>Applied to Invoice</th><th style={{width:36}}></th>
             </tr></thead>
             <tbody>
-              {filteredRows.length === 0 && <tr><td colSpan={13} className="empty-row">{emptyMsg}</td></tr>}
+              {filteredRows.length === 0 && <tr><td colSpan={14} className="empty-row">{emptyMsg}</td></tr>}
               {pg.pageRows.map((r) => (
                 <tr key={r.id} className={sel.selected.has(r.id) ? "row-selected" : ""}>
                   <td className="text-center"><RowCheckbox id={r.id} selected={sel.selected} toggle={sel.toggle} /></td>
                   <td><Field type="date" value={r.date} onChange={(v) => update(r.id, { date: v })} /></td>
-                  <td><Field type="combo" options={custOptions} value={r.from} onChange={(v) => update(r.id, { from: v })}
+                  <td><Field type="combo" options={custOptions} value={r.from} onChange={(v) => update(r.id, { from: v, appliedToSalesId: "" })}
                     onAddNew={(typed) => setQuickAddCustomer({ rowId: r.id, typedName: typed })} addNewLabel="customer" /></td>
                   <td><Field value={r.orNo} onChange={(v) => update(r.id, { orNo: v })} placeholder="OR-001" /></td>
                   <td><Field value={r.desc} onChange={(v) => update(r.id, { desc: v })} /></td>
@@ -3698,13 +3891,14 @@ function ReceiptsPage({ data, setData }) {
                   <td><ReadCell align="right">{fmt(r.net)}</ReadCell></td>
                   <td><Field type="select" options={BANK_ACCOUNTS} value={r.bankAccount} onChange={(v) => update(r.id, { bankAccount: v })} /></td>
                   <td><Field type="combo" options={acctOptions} value={r.coaCode} onChange={(v) => update(r.id, { coaCode: v })} /></td>
+                  <td><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AR, data, r.from, r.appliedToSalesId)} value={r.appliedToSalesId || ""} onChange={(v) => update(r.id, { appliedToSalesId: v })} /></td>
                   <td className="text-center"><DelBtn onClick={() => onDelete(r.id)} /></td>
                 </tr>
               ))}
             </tbody>
             {filteredRows.length > 0 && (
               <tfoot><tr><td colSpan={7} className="totals-label">Totals</td>
-                <td className="num">{fmt(totals.amount)}</td><td className="num">{fmt(totals.cwt)}</td><td className="num">{fmt(totals.net)}</td><td colSpan={3}></td>
+                <td className="num">{fmt(totals.amount)}</td><td className="num">{fmt(totals.cwt)}</td><td className="num">{fmt(totals.net)}</td><td colSpan={4}></td>
               </tr></tfoot>
             )}
           </table>
@@ -3866,7 +4060,7 @@ function GeneralJournalPage({ data, setData }) {
       )}
 
       {modalOpen && (
-        <JournalVoucherModal data={data} nextJvNo={`JV-${String(data.generalJournal.length + 1).padStart(3, "0")}`}
+        <JournalVoucherModal data={data} nextJvNo={suggestNextJvNo(data.generalJournal, todayMDY())}
           onCancel={() => setModalOpen(false)}
           onSubmit={(jv) => { setData((d) => ({ ...d, generalJournal: [...d.generalJournal, jv] })); setModalOpen(false); }} />
       )}
@@ -3874,7 +4068,7 @@ function GeneralJournalPage({ data, setData }) {
         <JournalPreviewModal voucher={previewVoucher} coaByCode={coaByCode} onClose={() => setPreviewVoucher(null)} onCopy={onMakeCopy} />
       )}
       {copySource && (
-        <JournalVoucherModal data={data} nextJvNo={`JV-${String(data.generalJournal.length + 1).padStart(3, "0")}`}
+        <JournalVoucherModal data={data} nextJvNo={suggestNextJvNo(data.generalJournal, todayMDY())}
           initial={{ date: todayMDY(), particulars: copySource.particulars, lines: copySource.lines }}
           title={`Copy of ${copySource.jvNo || "Journal Entry"}`} submitLabel="Post"
           onCancel={() => setCopySource(null)} onSubmit={onPostCopy} />
@@ -4577,6 +4771,172 @@ function BalanceSheetPage({ data, postings, coaMap }) {
 
       <div className={"check-strip" + (Math.abs(result.check) < 0.01 ? " ok" : " bad")}>
         {Math.abs(result.check) < 0.01 ? "✓ Balance sheet balances." : `⚠ Out of balance by ${fmt(result.check)} — check journal entries.`}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== AP / AR AGING ============================== */
+
+// A payment row (Cash Disbursement / Cash Receipt) links to the invoice it settles via
+// appliedToPurchaseId / appliedToSalesId. An invoice's outstanding balance is its recorded total
+// minus every payment applied to it — partial/installment payments need no special handling since
+// multiple payment rows can point at the same invoice.
+function paymentsAppliedTo(invoiceId, payments, refField) {
+  if (!invoiceId) return 0;
+  return (payments || []).reduce((s, p) => s + (p[refField] === invoiceId ? num(p.amount) : 0), 0);
+}
+function getOutstandingBalance(invoiceRow, payments, refField) {
+  return round2(num(invoiceRow.total) - paymentsAppliedTo(invoiceRow.id, payments, refField));
+}
+function agingBucket(ageDays) {
+  return ageDays <= 30 ? "Current" : ageDays <= 60 ? "31–60" : ageDays <= 90 ? "61–90" : "91+";
+}
+const AGING_BUCKETS = ["Current", "31–60", "61–90", "91+"];
+
+const AGING_SIDES = {
+  AP: {
+    title: "AP Aging", noun: "payables", partyLabel: "Supplier",
+    invoicesKey: "purchases", paymentsKey: "disbursements", refField: "appliedToPurchaseId",
+    partyField: "supplier", invNoField: "invNo",
+  },
+  AR: {
+    title: "AR Aging", noun: "receivables", partyLabel: "Customer",
+    invoicesKey: "sales", paymentsKey: "receipts", refField: "appliedToSalesId",
+    partyField: "customer", invNoField: "siNo",
+  },
+};
+
+// Options for a payment row's "Applied to Invoice" combo: that party's credit-terms invoices that
+// still have an outstanding balance, plus (for inline editing) whatever invoice the row already
+// references even if it's since been fully paid.
+function openInvoiceOptions(cfg, data, partyName, keepId) {
+  const party = (partyName || "").trim().toLowerCase();
+  const opts = (data[cfg.invoicesKey] || [])
+    .filter((inv) => inv.terms === "Credit" && (inv[cfg.partyField] || "").trim().toLowerCase() === party && party !== "")
+    .map((inv) => ({ inv, outstanding: getOutstandingBalance(inv, data[cfg.paymentsKey], cfg.refField) }))
+    .filter((x) => x.outstanding > 0.01 || x.inv.id === keepId)
+    .map(({ inv, outstanding }) => ({
+      value: inv.id,
+      label: `${inv[cfg.invNoField] || "—"} — ${inv.date} — ${fmtPlain(num(inv.total))} total, ${fmtPlain(outstanding)} outstanding`,
+    }));
+  return [{ value: "", label: "— not settling an invoice —" }, ...opts];
+}
+
+// Open invoices for aging: credit-terms only (a cash invoice is settled at point of sale, not a
+// payable/receivable), dated on/before the as-of date, with a positive outstanding balance.
+function buildAgingRows(cfg, data, asOfDate) {
+  const payments = data[cfg.paymentsKey] || [];
+  return (data[cfg.invoicesKey] || [])
+    .map((inv) => {
+      if (inv.terms !== "Credit") return null;
+      const d = parseAppDate(inv.date);
+      if (!d || d > asOfDate) return null;
+      const total = round2(num(inv.total));
+      const paid = round2(paymentsAppliedTo(inv.id, payments, cfg.refField));
+      const outstanding = round2(total - paid);
+      if (outstanding <= 0.01) return null;
+      const ageDays = Math.max(0, Math.floor((asOfDate - d) / 86400000));
+      return {
+        id: inv.id, party: (inv[cfg.partyField] || "—").trim() || "—", invNo: inv[cfg.invNoField] || "—",
+        date: inv.date, total, paid, outstanding, ageDays, bucket: agingBucket(ageDays),
+      };
+    })
+    .filter(Boolean);
+}
+
+function AgingReportPage({ data, side }) {
+  const cfg = AGING_SIDES[side];
+  const [asOf, setAsOf] = useState(todayMDY());
+  const asOfDate = useMemo(() => parseAppDate(asOf) || new Date(), [asOf]);
+  const rows = useMemo(() => buildAgingRows(cfg, data, asOfDate), [cfg, data, asOfDate]);
+
+  const groups = useMemo(() => {
+    const m = new Map();
+    rows.forEach((r) => { if (!m.has(r.party)) m.set(r.party, []); m.get(r.party).push(r); });
+    return [...m.entries()]
+      .map(([party, rs]) => ({
+        party,
+        rows: rs.slice().sort((a, b) => b.ageDays - a.ageDays),
+        subtotal: rs.reduce((a, r) => ({ total: a.total + r.total, paid: a.paid + r.paid, outstanding: a.outstanding + r.outstanding }), { total: 0, paid: 0, outstanding: 0 }),
+      }))
+      .sort((a, b) => a.party.localeCompare(b.party, undefined, { sensitivity: "base" }));
+  }, [rows]);
+
+  const grand = rows.reduce((a, r) => ({ total: a.total + r.total, paid: a.paid + r.paid, outstanding: a.outstanding + r.outstanding }), { total: 0, paid: 0, outstanding: 0 });
+  const bucketTotals = AGING_BUCKETS.map((b) => ({ b, amount: round2(rows.filter((r) => r.bucket === b).reduce((s, r) => s + r.outstanding, 0)) }));
+
+  return (
+    <div className="pnl-shell">
+      <div className="pnl-toolbar">
+        <div className="pnl-toolbar-top">
+          <h1>{cfg.title}</h1>
+          <div className="pnl-badge">By {cfg.partyLabel.toLowerCase()}, aged from invoice date</div>
+        </div>
+        <div className="pnl-controls-row">
+          <span className="pnl-daterange-label">As of:</span>
+          <div style={{ width: 150 }}><Field type="date" value={asOf} onChange={setAsOf} /></div>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", margin: "0 0 14px" }}>
+        {[...bucketTotals, { b: "Total Outstanding", amount: round2(grand.outstanding), total: true }].map(({ b, amount, total }) => (
+          <div key={b} style={{ flex: "1 1 130px", border: "1px solid var(--border, #e2e8f0)", borderRadius: 8, padding: "8px 12px", background: total ? "var(--accent-soft, #eef2ff)" : "var(--panel, #f8fafc)" }}>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>{b}</div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>{fmtPlain(amount)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="pnl-card">
+        <div className="pnl-card-head">
+          <div className="pnl-card-title">{cfg.title}</div>
+          <div className="pnl-company">{data.company.name || "Your Company Name Inc."}</div>
+          <div className="pnl-currency">PHP (Philippine Peso)</div>
+          <div className="pnl-period">As of {formatDMY(asOfDate)}.</div>
+        </div>
+        {groups.length === 0 ? (
+          <div className="pnl-table"><div className="dim" style={{ padding: "14px 4px" }}>No outstanding {cfg.noun} as of {formatDMY(asOfDate)}.</div></div>
+        ) : (
+          <table className="pnl-table">
+            <tbody>
+              <tr className="pnl-section">
+                <td>{cfg.partyLabel} / Invoice No.</td><td className="num">Date</td><td className="num">Total</td>
+                <td className="num">Amount Paid</td><td className="num">Outstanding</td><td className="num">Age</td><td>Bucket</td>
+              </tr>
+              {groups.map((g) => (
+                <React.Fragment key={g.party}>
+                  <tr className="pnl-line"><td colSpan={7}><strong>{g.party}</strong></td></tr>
+                  {g.rows.map((r) => (
+                    <tr className="pnl-line" key={r.id}>
+                      <td style={{ paddingLeft: 20 }}>{r.invNo}</td>
+                      <td className="num">{r.date}</td>
+                      <td className="num">{fmtPlain(r.total)}</td>
+                      <td className="num">{r.paid ? fmtPlain(r.paid) : "—"}</td>
+                      <td className="num">{fmtPlain(r.outstanding)}</td>
+                      <td className="num">{r.ageDays}d</td>
+                      <td>{r.bucket}</td>
+                    </tr>
+                  ))}
+                  <tr className="pnl-total">
+                    <td>Subtotal — {g.party}</td><td></td>
+                    <td className="num">{fmtPlain(g.subtotal.total)}</td>
+                    <td className="num">{fmtPlain(g.subtotal.paid)}</td>
+                    <td className="num">{fmtPlain(g.subtotal.outstanding)}</td>
+                    <td colSpan={2}></td>
+                  </tr>
+                </React.Fragment>
+              ))}
+              <tr className="pnl-grand pnl-final">
+                <td>Grand Total</td><td></td>
+                <td className="num">{fmtPlain(grand.total)}</td>
+                <td className="num">{fmtPlain(grand.paid)}</td>
+                <td className="num">{fmtPlain(grand.outstanding)}</td>
+                <td colSpan={2}></td>
+              </tr>
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
@@ -6529,63 +6889,128 @@ function AlphalistEmployeesPage({ data, setData }) {
 
 /* ============================== FIXED ASSET LEDGER ============================== */
 
-const ASSET_CATEGORIES = ["Transportation Vehicle","Furniture and Fixtures","Office Equipment","Machinery and Equipment","Building and Improvements","Other"];
-
-function FixedAssetEntryModal({ data, onCancel, onSubmit }) {
+function FixedAssetEntryModal({ data, setData, initial, onCancel, onSubmit }) {
   const assetAcctOptions = data.coa.filter((a) => a.type === "Asset").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const expAcctOptions = data.coa.filter((a) => a.type === "Expense").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
+  const categoryOptions = assetCategoryOptions(data);
   const [v, setV] = useState({
-    name: "", code: "", category: "Office Equipment", acquisitionDate: todayMDY(),
-    cost: 0, salvageValue: 0, usefulLifeYears: 5,
+    name: "", code: "", category: "", acquisitionDate: todayMDY(), depreciationStartDate: todayMDY(),
+    cost: 0, salvageValue: 0, usefulLifeYears: 5, openingAccumulatedDep: 0,
     assetAccount: "", accumDepAccount: "", depExpenseAccount: "6020",
     status: "Active", postedPeriods: [],
+    ...(initial || {}),
   });
+  // Depreciation Starting Date defaults to Acquisition Date and follows it, until edited directly.
+  const [depStartTouched, setDepStartTouched] = useState(!!(initial && initial.depreciationStartDate));
   const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+  const onAcqDate = (x) => setV((p) => ({ ...p, acquisitionDate: x, ...(depStartTouched ? {} : { depreciationStartDate: x }) }));
+  const addCategory = (name) => {
+    const n = String(name || "").trim();
+    if (!n) return;
+    setData && setData((d) => {
+      const known = new Set([...ASSET_CATEGORIES, ...((d.assetCategories) || [])].map((c) => String(c).toLowerCase()));
+      return known.has(n.toLowerCase()) ? d : { ...d, assetCategories: [...((d.assetCategories) || []), n] };
+    });
+    set("category", n);
+  };
   const computed = computeAssetRow(v);
   return (
-    <EntryModalShell title="Add Fixed Asset" submitLabel="Add asset" onCancel={onCancel}
+    <EntryModalShell title={initial && initial.sourceTransactionId ? "Admit Asset from Transaction" : "Add Fixed Asset"} submitLabel={initial && initial.sourceTransactionId ? "Save asset" : "Add asset"} onCancel={onCancel}
       onSubmit={() => onSubmit(computeAssetRow({ id: uid(), ...v }))}>
       <LabeledField label="Asset Name" wide><Field value={v.name} onChange={(x) => set("name", x)} placeholder="Delivery Van - Toyota Hiace" /></LabeledField>
       <LabeledField label="Asset Code"><Field value={v.code} onChange={(x) => set("code", x)} placeholder="FA-001" /></LabeledField>
-      <LabeledField label="Category"><Field type="select" options={ASSET_CATEGORIES} value={v.category} onChange={(x) => set("category", x)} /></LabeledField>
-      <LabeledField label="Acquisition Date"><Field type="date" value={v.acquisitionDate} onChange={(x) => set("acquisitionDate", x)} /></LabeledField>
+      <LabeledField label="Category"><Field type="combo" options={categoryOptions} value={v.category} onChange={(x) => set("category", x)} onAddNew={addCategory} addNewLabel="category" /></LabeledField>
+      <LabeledField label="Acquisition Date"><Field type="date" value={v.acquisitionDate} onChange={onAcqDate} /></LabeledField>
+      <LabeledField label="Depreciation Starting Date"><Field type="date" value={v.depreciationStartDate} onChange={(x) => { setDepStartTouched(true); set("depreciationStartDate", x); }} /></LabeledField>
       <LabeledField label="Cost"><Field type="number" align="right" value={v.cost} onChange={(x) => set("cost", x)} /></LabeledField>
       <LabeledField label="Salvage Value"><Field type="number" align="right" value={v.salvageValue} onChange={(x) => set("salvageValue", x)} /></LabeledField>
       <LabeledField label="Useful Life (Years)"><Field type="number" align="right" value={v.usefulLifeYears} onChange={(x) => set("usefulLifeYears", x)} /></LabeledField>
+      <LabeledField label="Opening Accum. Depreciation"><Field type="number" align="right" value={v.openingAccumulatedDep} onChange={(x) => set("openingAccumulatedDep", x)} /></LabeledField>
       <LabeledField label="Asset Account"><Field type="combo" options={assetAcctOptions} value={v.assetAccount} onChange={(x) => set("assetAccount", x)} /></LabeledField>
       <LabeledField label="Accumulated Depreciation Account"><Field type="combo" options={assetAcctOptions} value={v.accumDepAccount} onChange={(x) => set("accumDepAccount", x)} /></LabeledField>
       <LabeledField label="Depreciation Expense Account"><Field type="combo" options={expAcctOptions} value={v.depExpenseAccount} onChange={(x) => set("depExpenseAccount", x)} /></LabeledField>
-      <LabeledField label="Status"><Field type="select" options={["Active","Disposed"]} value={v.status} onChange={(x) => set("status", x)} /></LabeledField>
-      <ComputedPreview items={[["Monthly Depreciation", fmt(computed.monthlyDep)], ["Book Value (at start)", fmt(v.cost)]]} />
+      <LabeledField label="Status"><Field type="select" options={ASSET_STATUSES} value={v.status} onChange={(x) => set("status", x)} /></LabeledField>
+      <ComputedPreview items={[["Monthly Depreciation", fmt(computed.monthlyDep)], ["Opening Accum. Dep.", fmt(v.openingAccumulatedDep)], ["Book Value (at start)", fmt(computed.bookValue)]]} />
     </EntryModalShell>
   );
 }
+
+// A Fixed-Assets purchase can be posted through Purchase Journal, Cash Disbursements or a General
+// Journal entry without also being tracked here — this scans those journals for debits to a
+// Fixed-Assets-type COA account that no ledger asset references and that haven't been dismissed.
+function findUnreconciledFixedAssetTransactions(data) {
+  const fixedAssetCodes = new Set(
+    (data.coa || []).filter((a) => a.accountType === "Fixed Assets" && !/contra/i.test(a.notes || "")).map((a) => a.code)
+  );
+  if (fixedAssetCodes.size === 0) return [];
+  const trackedTxnIds = new Set((data.fixedAssets || []).filter((a) => a.sourceTransactionId).map((a) => a.sourceTransactionId));
+  const ignoredIds = new Set(data.ignoredAssetCandidates || []);
+  const out = [];
+  const consider = (sourceJournal, sourceTransactionId, date, amount, description, party) => {
+    if (!sourceTransactionId || trackedTxnIds.has(sourceTransactionId) || ignoredIds.has(sourceTransactionId)) return;
+    out.push({ sourceJournal, sourceTransactionId, date: date || "", amount: round2(amount), description: description || "", party: party || "" });
+  };
+  (data.purchases || []).forEach((r) => {
+    if (fixedAssetCodes.has(r.coaCode)) consider("purchases", r.id, r.date, (num(r.vatable) + num(r.nonvat)) || num(r.total), r.desc, r.supplier);
+  });
+  (data.disbursements || []).forEach((r) => {
+    if (fixedAssetCodes.has(r.coaCode)) consider("disbursements", r.id, r.date, num(r.amount), r.desc, r.vendor);
+  });
+  (data.generalJournal || []).forEach((jv) => {
+    (jv.lines || []).forEach((line, i) => {
+      if (fixedAssetCodes.has(line.account) && num(line.debit) > 0) consider("generaljournal", `${jv.id}-${i}`, jv.date, num(line.debit), jv.particulars, "");
+    });
+  });
+  return out;
+}
+const SOURCE_JOURNAL_LABELS = { purchases: "Purchase Journal", disbursements: "Cash Disbursements", generaljournal: "General Journal" };
 
 function FixedAssetLedgerPage({ data, setData }) {
   const coaByCode = useMemo(() => Object.fromEntries(data.coa.map((a) => [a.code, a])), [data.coa]);
   const assetAcctOptions = data.coa.filter((a) => a.type === "Asset").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const expAcctOptions = data.coa.filter((a) => a.type === "Expense").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
+  const categoryOptions = assetCategoryOptions(data);
   const [modalOpen, setModalOpen] = useState(false);
+  const [admitCandidate, setAdmitCandidate] = useState(null); // reconciliation candidate being admitted
   const assets = useMemo(() => (data.fixedAssets || []).map(computeAssetRow), [data.fixedAssets]);
 
   const update = (id, patch) => setData((d) => ({ ...d, fixedAssets: d.fixedAssets.map((r) => r.id === id ? computeAssetRow({ ...r, ...patch }) : r) }));
   const onDelete = (id) => setData((d) => ({ ...d, fixedAssets: d.fixedAssets.filter((r) => r.id !== id) }));
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
+  const importHook = useJournalImport("fixedassets", data, ({ newRows }) => setData((d) => ({ ...d, fixedAssets: [...(d.fixedAssets || []), ...newRows] })));
+  const exportHook = useJournalExport("fixedassets", data, assets, coaByCode);
+
+  const candidates = useMemo(() => findUnreconciledFixedAssetTransactions(data), [data]);
+  const onIgnoreCandidate = (txnId) => setData((d) => ({ ...d, ignoredAssetCandidates: [...(d.ignoredAssetCandidates || []), txnId] }));
+
   const [postMonth, setPostMonth] = useState(new Date().getMonth() + 1);
   const [postYear, setPostYear] = useState(new Date().getFullYear());
   const periodKey = `${postYear}-${pad2(postMonth)}`;
   const periodLabel = `${MONTHS[postMonth - 1]} ${postYear}`;
 
+  // Postable years come from each asset's own Depreciation Starting Date through the current year —
+  // not a fixed global range, so an asset acquired years before adopting Haki isn't blocked.
+  const postYearOptions = useMemo(() => {
+    const cur = new Date().getFullYear();
+    const yrs = new Set([cur - 1, cur, cur + 1]);
+    assets.forEach((a) => {
+      const d = parseAppDate(assetDepStartDate(a));
+      if (d) for (let y = d.getFullYear(); y <= cur; y++) yrs.add(y);
+      (a.postedPeriods || []).forEach((k) => { const y = parseInt(String(k).slice(0, 4), 10); if (!isNaN(y)) yrs.add(y); });
+    });
+    return [...yrs].sort((x, y) => x - y);
+  }, [assets]);
+
   const dueThisPeriod = useMemo(() => {
     return assets.filter((a) => {
-      if (a.status === "Disposed") return false;
+      if (a.status !== "Active") return false; // Fully Depreciated / Disposed are not postable
       if (a.fullyDepreciated) return false;
       if (a.monthlyDep <= 0) return false;
-      const acqDate = parseAppDate(a.acquisitionDate);
-      if (!acqDate) return false;
-      const acqKey = `${acqDate.getFullYear()}-${pad2(acqDate.getMonth() + 1)}`;
-      if (periodKey < acqKey) return false; // can't depreciate before acquisition
+      const startDate = parseAppDate(assetDepStartDate(a));
+      if (!startDate) return false;
+      const startKey = `${startDate.getFullYear()}-${pad2(startDate.getMonth() + 1)}`;
+      if (periodKey < startKey) return false; // can't depreciate before the depreciation start date
       if ((a.postedPeriods || []).includes(periodKey)) return false; // already posted this period
       return true;
     });
@@ -6606,9 +7031,10 @@ function FixedAssetLedgerPage({ data, setData }) {
       ...Object.entries(expByAccount).map(([account, debit]) => ({ id: uid(), account, debit, credit: 0 })),
       ...Object.entries(accumByAccount).map(([account, credit]) => ({ id: uid(), account, debit: 0, credit })),
     ];
-    const jvNo = `JV-${String(data.generalJournal.length + 1).padStart(3, "0")}`;
     const monthEndDate = monthEnd(postYear, postMonth - 1);
-    const jv = { id: uid(), jvNo, date: `${pad2(postMonth)}/${pad2(monthEndDate.getDate())}/${postYear}`, particulars: `Monthly depreciation — ${periodLabel}`, lines };
+    const jvDate = `${pad2(postMonth)}/${pad2(monthEndDate.getDate())}/${postYear}`;
+    const jvNo = suggestNextJvNo(data.generalJournal, jvDate);
+    const jv = { id: uid(), jvNo, date: jvDate, particulars: `Monthly depreciation — ${periodLabel}`, lines };
     setData((d) => ({
       ...d,
       generalJournal: [...d.generalJournal, jv],
@@ -6618,51 +7044,90 @@ function FixedAssetLedgerPage({ data, setData }) {
     setTimeout(() => setPostStatus(null), 5000);
   };
 
-  const totals = assets.reduce((a, r) => ({ cost: a.cost + num(r.cost), accumDep: a.accumDep + num(r.accumulatedDep), bookValue: a.bookValue + num(r.bookValue) }), { cost: 0, accumDep: 0, bookValue: 0 });
+  const totals = assets.reduce((a, r) => ({
+    cost: a.cost + num(r.cost), opening: a.opening + num(r.openingAccumulatedDep),
+    monthly: a.monthly + num(r.monthlyDep), accumDep: a.accumDep + num(r.accumulatedDep), bookValue: a.bookValue + num(r.bookValue),
+  }), { cost: 0, opening: 0, monthly: 0, accumDep: 0, bookValue: 0 });
 
   return (
     <div>
       <SectionHeader icon={Landmark} title="Fixed Asset Ledger" subtitle="Straight-line depreciation, computed automatically — post it to the General Journal whenever you're ready."
-        right={<AddRowBtn onClick={() => setModalOpen(true)}>Add asset</AddRowBtn>} />
+        right={<div className="header-actions"><ImportExportBar journalKey="fixedassets" data={data} importHook={importHook} /><ExportBar exportHook={exportHook} /><AddRowBtn onClick={() => setModalOpen(true)}>Add asset</AddRowBtn></div>} />
+      <ImportStatus status={importHook.status} />
+      <ExportStatus status={exportHook.status} />
+
+      {candidates.length > 0 && (
+        <div className="callout" style={{ display: "block" }}>
+          <div className="callout-title" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <Info size={16} /> {candidates.length} fixed-asset transaction{candidates.length === 1 ? "" : "s"} not yet in this ledger
+          </div>
+          <div className="callout-body" style={{ marginBottom: 10 }}>
+            These postings hit a Fixed Assets account but aren't tracked as an asset here, so the Balance Sheet's Fixed Assets line and this ledger's total book value can drift apart. Admit each one as a tracked asset, or ignore it (e.g. a miscoded expense).
+          </div>
+          <table className="ledger-table report-table">
+            <thead><tr><th>Source</th><th>Date</th><th>Description</th><th className="num-head">Amount</th><th style={{width:150}}></th></tr></thead>
+            <tbody>
+              {candidates.map((c) => (
+                <tr key={c.sourceTransactionId}>
+                  <td>{SOURCE_JOURNAL_LABELS[c.sourceJournal] || c.sourceJournal}{c.party ? ` · ${c.party}` : ""}</td>
+                  <td>{c.date}</td>
+                  <td>{c.description || "—"}</td>
+                  <td className="num">{fmt(c.amount)}</td>
+                  <td className="text-center">
+                    <button className="io-btn accent" onClick={() => setAdmitCandidate(c)}>Admit</button>
+                    <button className="io-btn" onClick={() => onIgnoreCandidate(c.sourceTransactionId)}>Ignore</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div className="ledger-wrap">
         <div className="table-scroll">
           <table className="ledger-table">
             <thead><tr>
               <th style={{minWidth:190}}>Asset Name</th><th style={{minWidth:90}}>Code</th><th style={{minWidth:160}}>Category</th>
-              <th style={{minWidth:120}}>Acquisition Date</th><th style={{minWidth:110}} className="num-head">Cost</th>
+              <th style={{minWidth:120}}>Acquisition Date</th><th style={{minWidth:130}}>Dep. Starting Date</th><th style={{minWidth:110}} className="num-head">Cost</th>
               <th style={{minWidth:110}} className="num-head">Salvage Value</th><th style={{minWidth:90}} className="num-head">Life (Yrs)</th>
+              <th style={{minWidth:130}} className="num-head">Opening Accum. Dep.</th>
               <th style={{minWidth:110}} className="num-head">Monthly Dep.</th><th style={{minWidth:120}} className="num-head">Accum. Dep.</th>
               <th style={{minWidth:110}} className="num-head">Book Value</th>
               <th style={{minWidth:170}}>Asset Account</th><th style={{minWidth:200}}>Accum. Dep. Account</th><th style={{minWidth:190}}>Dep. Expense Account</th>
-              <th style={{minWidth:100}}>Status</th><th style={{width:36}}></th>
+              <th style={{minWidth:130}}>Status</th><th style={{width:36}}></th>
             </tr></thead>
             <tbody>
-              {assets.length === 0 && <tr><td colSpan={15} className="empty-row">No fixed assets yet — add your first one above.</td></tr>}
+              {assets.length === 0 && <tr><td colSpan={17} className="empty-row">No fixed assets yet — add your first one above.</td></tr>}
               {assets.map((r) => (
                 <tr key={r.id}>
                   <td><Field value={r.name} onChange={(v) => update(r.id, { name: v })} /></td>
                   <td><Field value={r.code} onChange={(v) => update(r.id, { code: v })} /></td>
-                  <td><Field type="select" options={ASSET_CATEGORIES} value={r.category} onChange={(v) => update(r.id, { category: v })} /></td>
+                  <td><Field type="combo" options={categoryOptions} value={r.category} onChange={(v) => update(r.id, { category: v })}
+                    onAddNew={(typed) => { const n = String(typed || "").trim(); if (!n) return; setData((d) => { const known = new Set([...ASSET_CATEGORIES, ...((d.assetCategories) || [])].map((c) => String(c).toLowerCase())); const withCat = known.has(n.toLowerCase()) ? d : { ...d, assetCategories: [...((d.assetCategories) || []), n] }; return { ...withCat, fixedAssets: withCat.fixedAssets.map((x) => x.id === r.id ? computeAssetRow({ ...x, category: n }) : x) }; }); }} addNewLabel="category" /></td>
                   <td><Field type="date" value={r.acquisitionDate} onChange={(v) => update(r.id, { acquisitionDate: v })} /></td>
+                  <td><Field type="date" value={r.depreciationStartDate || ""} onChange={(v) => update(r.id, { depreciationStartDate: v })} /></td>
                   <td><Field type="number" align="right" value={r.cost} onChange={(v) => update(r.id, { cost: v })} /></td>
                   <td><Field type="number" align="right" value={r.salvageValue} onChange={(v) => update(r.id, { salvageValue: v })} /></td>
                   <td><Field type="number" align="right" value={r.usefulLifeYears} onChange={(v) => update(r.id, { usefulLifeYears: v })} /></td>
+                  <td><Field type="number" align="right" value={r.openingAccumulatedDep || 0} onChange={(v) => update(r.id, { openingAccumulatedDep: v })} /></td>
                   <td><ReadCell align="right">{fmt(r.monthlyDep)}</ReadCell></td>
                   <td><ReadCell align="right">{fmt(r.accumulatedDep)}</ReadCell></td>
                   <td><ReadCell align="right">{fmt(r.bookValue)}</ReadCell></td>
                   <td><Field type="combo" options={assetAcctOptions} value={r.assetAccount} onChange={(v) => update(r.id, { assetAccount: v })} /></td>
                   <td><Field type="combo" options={assetAcctOptions} value={r.accumDepAccount} onChange={(v) => update(r.id, { accumDepAccount: v })} /></td>
                   <td><Field type="combo" options={expAcctOptions} value={r.depExpenseAccount} onChange={(v) => update(r.id, { depExpenseAccount: v })} /></td>
-                  <td><Field type="select" options={["Active","Disposed"]} value={r.status} onChange={(v) => update(r.id, { status: v })} /></td>
+                  <td><Field type="select" options={ASSET_STATUSES} value={r.status} onChange={(v) => update(r.id, { status: v })} /></td>
                   <td className="text-center"><DelBtn onClick={() => setConfirmDeleteId(r.id)} /></td>
                 </tr>
               ))}
             </tbody>
             {assets.length > 0 && (
               <tfoot><tr>
-                <td colSpan={4} className="totals-label">Totals</td>
+                <td colSpan={5} className="totals-label">Totals</td>
                 <td className="num">{fmt(totals.cost)}</td><td colSpan={2}></td>
-                <td></td><td className="num">{fmt(totals.accumDep)}</td><td className="num">{fmt(totals.bookValue)}</td>
+                <td className="num">{fmt(totals.opening)}</td><td className="num">{fmt(totals.monthly)}</td>
+                <td className="num">{fmt(totals.accumDep)}</td><td className="num">{fmt(totals.bookValue)}</td>
                 <td colSpan={5}></td>
               </tr></tfoot>
             )}
@@ -6674,7 +7139,7 @@ function FixedAssetLedgerPage({ data, setData }) {
       <div className="form-card">
         <div className="form-grid">
           <LabeledField label="Month"><Field type="select" options={MONTHS.map((m, i) => ({ value: i + 1, label: m }))} value={postMonth} onChange={(v) => setPostMonth(Number(v))} /></LabeledField>
-          <LabeledField label="Year"><Field type="select" options={getAvailableYears(data)} value={postYear} onChange={(v) => setPostYear(Number(v))} /></LabeledField>
+          <LabeledField label="Year"><Field type="select" options={postYearOptions} value={postYear} onChange={(v) => setPostYear(Number(v))} /></LabeledField>
         </div>
       </div>
       {missingAccounts.length > 0 && (
@@ -6719,8 +7184,21 @@ function FixedAssetLedgerPage({ data, setData }) {
       )}
 
       {modalOpen && (
-        <FixedAssetEntryModal data={data} onCancel={() => setModalOpen(false)}
+        <FixedAssetEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
           onSubmit={(row) => { setData((d) => ({ ...d, fixedAssets: [...(d.fixedAssets || []), row] })); setModalOpen(false); }} />
+      )}
+      {admitCandidate && (
+        <FixedAssetEntryModal data={data} setData={setData}
+          initial={{
+            name: admitCandidate.description,
+            cost: admitCandidate.amount,
+            acquisitionDate: toMDY(admitCandidate.date),
+            depreciationStartDate: toMDY(admitCandidate.date),
+            sourceJournal: admitCandidate.sourceJournal,
+            sourceTransactionId: admitCandidate.sourceTransactionId,
+          }}
+          onCancel={() => setAdmitCandidate(null)}
+          onSubmit={(row) => { setData((d) => ({ ...d, fixedAssets: [...(d.fixedAssets || []), row] })); setAdmitCandidate(null); }} />
       )}
       {confirmDeleteId && (
         <ConfirmModal title="Delete asset" danger confirmLabel="Delete"
@@ -7358,6 +7836,11 @@ function Style() {
       .computed-preview-item strong { font-family: 'IBM Plex Mono', monospace; color: var(--green-deep); }
       .modal-lines { grid-column: 1 / -1; }
       .modal-lines .ledger-table { margin-bottom: 8px; }
+      .ml-lines-label { font-size: 11.5px; font-weight: 600; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+      .ml-line-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; background: var(--paper-deep); }
+      .ml-line-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 600; color: var(--ink-soft); margin-bottom: 10px; }
+      .ml-line-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+      .ml-line-foot { margin-top: 10px; font-size: 11.5px; color: var(--ink-soft); font-family: 'IBM Plex Mono', monospace; }
 
       .kpi-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 22px; }
       .kpi-card { background: var(--white); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
