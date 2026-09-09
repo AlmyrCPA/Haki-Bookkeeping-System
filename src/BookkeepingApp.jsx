@@ -64,6 +64,17 @@ const ITEM_TYPES = ["Services", "Other than Capital Goods", "Capital Goods"];
 const COA_TYPES = ["Asset", "Liability", "Equity", "Revenue", "Cost of Sales", "Expense"];
 const COA_SUBCLASSES = ["Current asset","Non Current Asset","Current Liabilities","Non-current Liabilities","Equity","Revenue","Cost of Goods Sold","Cost of services","Operating expense","Other Income","Other Expense","Income Tax expense"];
 const COA_ACCOUNT_TYPES = ["Bank","Account Receivable","Current asset","Fixed Assets","Non Current Asset","Accounts Payable","Current Liabilities","Non-current Liabilities","Equity","Revenue","Cost of Goods Sold","Cost of services","Operating expense","Other Income","Other Expense","Income Tax expense"];
+// Seed list for the Fixed Asset "Category" combo — free-form, grows via data.assetCategories.
+const ASSET_CATEGORIES = ["Transportation Vehicle","Furniture and Fixtures","Office Equipment","Machinery and Equipment","Building and Improvements","Other"];
+const ASSET_STATUSES = ["Active", "Fully Depreciated", "Disposed"];
+function assetCategoryOptions(data) {
+  const seen = new Set(); const out = [];
+  [...ASSET_CATEGORIES, ...((data && data.assetCategories) || [])].forEach((c) => {
+    const k = String(c || "").trim();
+    if (k && !seen.has(k.toLowerCase())) { seen.add(k.toLowerCase()); out.push(k); }
+  });
+  return out;
+}
 
 const DEFAULT_COA = [
   ["1000","Cash on Hand","Asset","Current asset","Bank",""],
@@ -256,6 +267,8 @@ export function makeInitialData() {
     inventoryLog: [], // {id, year, month, beginning, ending}
     importation: [],
     fixedAssets: [],
+    assetCategories: [],        // free-form Fixed Asset categories added by the user
+    ignoredAssetCandidates: [], // source-transaction ids dismissed from the reconciliation notice
     form2307: [],
     employees: [],
   };
@@ -403,19 +416,26 @@ function computeImportationRow(r) {
 }
 
 // Straight-line depreciation, the standard method for simple bookkeeping. Accumulated depreciation
-// reflects what's ACTUALLY been posted to the General Journal (via postedPeriods), not a theoretical
-// time-elapsed calculation — so the ledger always ties out to what's really in the books.
+// is an Opening balance (whatever was already recorded under a prior system before this asset was
+// set up in Haki) plus what's ACTUALLY been posted to the General Journal since (via postedPeriods)
+// — so the ledger ties out to the books while still supporting migrated assets.
 function computeAssetRow(r) {
   const cost = num(r.cost), salvage = num(r.salvageValue), lifeYears = num(r.usefulLifeYears);
   const depreciableBase = Math.max(0, round2(cost - salvage));
   const totalMonths = Math.round(lifeYears * 12);
   const monthlyDep = totalMonths > 0 ? round2(depreciableBase / totalMonths) : 0;
   const postedCount = (r.postedPeriods || []).length;
-  const accumulatedDep = Math.min(depreciableBase, round2(monthlyDep * postedCount));
+  const openingAccumDep = num(r.openingAccumulatedDep);       // recorded before this asset entered Haki
+  const postedDep = round2(monthlyDep * postedCount);          // posted through Haki's own monthly posting
+  const accumulatedDep = Math.min(depreciableBase, round2(openingAccumDep + postedDep));
   const bookValue = round2(cost - accumulatedDep);
   const fullyDepreciated = depreciableBase > 0 && accumulatedDep >= depreciableBase;
   return { ...r, monthlyDep, accumulatedDep, bookValue, fullyDepreciated };
 }
+// The date Haki should start computing NEW monthly depreciation from — same as Acquisition Date for
+// an asset bought after adopting Haki, but different for a migrated asset (the gap is covered by the
+// Opening Accumulated Depreciation).
+const assetDepStartDate = (a) => a.depreciationStartDate || a.acquisitionDate;
 
 /* ============================== EXCEL IMPORT / EXPORT ============================== */
 
@@ -537,6 +557,21 @@ const GJ_COLS = [
   { header: "Debit", field: "debit", type: "number" },
   { header: "Credit", field: "credit", type: "number" },
 ];
+const FIXEDASSET_COLS = [
+  { header: "Asset Name", field: "name" },
+  { header: "Asset Code", field: "code" },
+  { header: "Category", field: "category" },
+  { header: "Acquisition Date (MM/DD/YYYY)", field: "acquisitionDate" },
+  { header: "Depreciation Starting Date (MM/DD/YYYY)", field: "depreciationStartDate" },
+  { header: "Cost", field: "cost", type: "number" },
+  { header: "Salvage Value", field: "salvageValue", type: "number" },
+  { header: "Useful Life (Years)", field: "usefulLifeYears", type: "number" },
+  { header: "Opening Accumulated Depreciation", field: "openingAccumulatedDep", type: "number" },
+  { header: "Asset Account Code", field: "assetAccount" },
+  { header: "Accumulated Depreciation Account Code", field: "accumDepAccount" },
+  { header: "Depreciation Expense Account Code", field: "depExpenseAccount" },
+  { header: "Status (Active/Fully Depreciated/Disposed)", field: "status" },
+];
 
 const JOURNAL_SHEETS = {
   sales: { title: "Sales Journal", cols: SALES_COLS, dataKey: "sales" },
@@ -544,6 +579,7 @@ const JOURNAL_SHEETS = {
   disbursements: { title: "Cash Disbursements", cols: DISB_COLS, dataKey: "disbursements" },
   receipts: { title: "Cash Receipts", cols: RECEIPT_COLS, dataKey: "receipts" },
   generaljournal: { title: "General Journal", cols: GJ_COLS, dataKey: "generalJournal" },
+  fixedassets: { title: "Fixed Asset Ledger", cols: FIXEDASSET_COLS, dataKey: "fixedAssets" },
   form2307: { title: "Creditable Withholding Taxes", cols: FORM2307_COLS, dataKey: "form2307" },
   employees: { title: "Alphalist of Employees", cols: EMPLOYEE_COLS, dataKey: "employees" },
 };
@@ -591,6 +627,7 @@ const TEMPLATE_FIXED_LISTS = {
   "COA Account Type": COA_ACCOUNT_TYPES,
   "VAT Books": VAT_TYPE_BOOKS,
   "SLSPI Field": VAT_TYPE_SLSPI_FIELDS,
+  "Asset Status": ASSET_STATUSES,
 };
 
 // field -> dropdown source. { list: "<key in TEMPLATE_FIXED_LISTS>" } | { sheet, col }
@@ -600,6 +637,7 @@ const JOURNAL_TEMPLATE_DROPDOWNS = {
   disbursements: { vendor: { sheet: "Suppliers Master", col: "B" }, atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
   receipts: { atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
   generaljournal: { account: { sheet: "Chart of Accounts", col: "A" } },
+  fixedassets: { assetAccount: { sheet: "Chart of Accounts", col: "A" }, accumDepAccount: { sheet: "Chart of Accounts", col: "A" }, depExpenseAccount: { sheet: "Chart of Accounts", col: "A" }, status: { list: "Asset Status" } },
   form2307: { atc: { sheet: "ATC Reference", col: "A" } },
   employees: { isMWE: { list: "Yes / No" }, substitutedFiling: { list: "Yes / No" }, empStatus: { list: "Employment Status" }, prevEmpStatus: { list: "Employment Status" } },
 };
@@ -836,6 +874,17 @@ async function importJournalExcel(journalKey, file, data) {
       if (atc) r.atc = atc.code;
       return compute2307Row(r);
     });
+  } else if (journalKey === "fixedassets") {
+    newRows = rawRows.map((r) => {
+      r.acquisitionDate = toMDY(String(r.acquisitionDate ?? "").trim());
+      r.depreciationStartDate = r.depreciationStartDate ? toMDY(String(r.depreciationStartDate).trim()) : "";
+      if (!r.category) r.category = "Other";
+      const st = String(r.status ?? "").trim().toLowerCase();
+      r.status = st.startsWith("dispos") ? "Disposed" : (st.startsWith("full") ? "Fully Depreciated" : "Active");
+      if (!num(r.usefulLifeYears)) r.usefulLifeYears = 5;
+      r.postedPeriods = [];
+      return computeAssetRow(r);
+    });
   } else if (journalKey === "employees") {
     newRows = rawRows.map((r) => {
       if (!r.year) r.year = new Date().getFullYear();
@@ -934,6 +983,7 @@ const PREVIEW_EXTRA_COLS = {
   purchases: [["inputVat", "Input VAT"], ["total", "Total"], ["ewt", "EWT"], ["net", "Net Amount"]],
   disbursements: [["ewt", "EWT"], ["net", "Net Amount"]],
   receipts: [["net", "Net Amount"]],
+  fixedassets: [["monthlyDep", "Monthly Dep."], ["accumulatedDep", "Accum. Dep."], ["bookValue", "Book Value"]],
   form2307: [["atcRate", "Rate"], ["cwt", "CWT"]],
   employees: [["pGross", "Gross (Present)"], ["totalTaxableComp", "Total Taxable Comp."], ["taxDue", "Tax Due"]],
   generaljournal: [],
@@ -1073,6 +1123,14 @@ function buildExportTable(journalKey, rows, coaByCode) {
     const t = rows.reduce((a, r) => ({ gross: a.gross + num(r.pGross), nonTax: a.nonTax + num(r.pTotalNonTax), tax: a.tax + num(r.pTotalTax), taxableComp: a.taxableComp + num(r.totalTaxableComp), due: a.due + num(r.taxDue), wh: a.wh + num(r.taxWithheldPrev) + num(r.taxWithheldPresent) }), { gross: 0, nonTax: 0, tax: 0, taxableComp: 0, due: 0, wh: 0 });
     const totalsRow = ["", "", "", "", "", "TOTALS", fmtPlain(t.gross), fmtPlain(t.nonTax), fmtPlain(t.tax), fmtPlain(t.taxableComp), fmtPlain(t.due), fmtPlain(t.wh)];
     return { headers, body, totalsRow, numericCols: [6,7,8,9,10,11] };
+  }
+  if (journalKey === "fixedassets") {
+    const headers = ["Asset Name","Code","Category","Acquisition Date","Dep. Start Date","Cost","Salvage Value","Life (Yrs)","Opening Accum. Dep.","Monthly Dep.","Accum. Dep.","Book Value","Asset Account","Accum. Dep. Account","Dep. Expense Account","Status"];
+    const rowsC = rows.map((r) => computeAssetRow(r));
+    const body = rowsC.map((r) => [r.name, r.code, r.category, r.acquisitionDate, r.depreciationStartDate || r.acquisitionDate, fmtPlain(r.cost), fmtPlain(r.salvageValue), r.usefulLifeYears, fmtPlain(num(r.openingAccumulatedDep)), fmtPlain(r.monthlyDep), fmtPlain(r.accumulatedDep), fmtPlain(r.bookValue), acctLabel(r.assetAccount), acctLabel(r.accumDepAccount), acctLabel(r.depExpenseAccount), r.status]);
+    const t = rowsC.reduce((a, r) => ({ cost: a.cost + num(r.cost), salvage: a.salvage + num(r.salvageValue), opening: a.opening + num(r.openingAccumulatedDep), monthly: a.monthly + num(r.monthlyDep), accum: a.accum + num(r.accumulatedDep), book: a.book + num(r.bookValue) }), { cost: 0, salvage: 0, opening: 0, monthly: 0, accum: 0, book: 0 });
+    const totalsRow = ["", "", "", "", "TOTALS", fmtPlain(t.cost), fmtPlain(t.salvage), "", fmtPlain(t.opening), fmtPlain(t.monthly), fmtPlain(t.accum), fmtPlain(t.book), "", "", "", ""];
+    return { headers, body, totalsRow, numericCols: [5, 6, 8, 9, 10, 11] };
   }
   if (journalKey === "generaljournal") {
     const headers = ["JV No.","Date","Particulars","Account","Debit","Credit"];
@@ -6831,63 +6889,128 @@ function AlphalistEmployeesPage({ data, setData }) {
 
 /* ============================== FIXED ASSET LEDGER ============================== */
 
-const ASSET_CATEGORIES = ["Transportation Vehicle","Furniture and Fixtures","Office Equipment","Machinery and Equipment","Building and Improvements","Other"];
-
-function FixedAssetEntryModal({ data, onCancel, onSubmit }) {
+function FixedAssetEntryModal({ data, setData, initial, onCancel, onSubmit }) {
   const assetAcctOptions = data.coa.filter((a) => a.type === "Asset").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const expAcctOptions = data.coa.filter((a) => a.type === "Expense").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
+  const categoryOptions = assetCategoryOptions(data);
   const [v, setV] = useState({
-    name: "", code: "", category: "Office Equipment", acquisitionDate: todayMDY(),
-    cost: 0, salvageValue: 0, usefulLifeYears: 5,
+    name: "", code: "", category: "", acquisitionDate: todayMDY(), depreciationStartDate: todayMDY(),
+    cost: 0, salvageValue: 0, usefulLifeYears: 5, openingAccumulatedDep: 0,
     assetAccount: "", accumDepAccount: "", depExpenseAccount: "6020",
     status: "Active", postedPeriods: [],
+    ...(initial || {}),
   });
+  // Depreciation Starting Date defaults to Acquisition Date and follows it, until edited directly.
+  const [depStartTouched, setDepStartTouched] = useState(!!(initial && initial.depreciationStartDate));
   const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+  const onAcqDate = (x) => setV((p) => ({ ...p, acquisitionDate: x, ...(depStartTouched ? {} : { depreciationStartDate: x }) }));
+  const addCategory = (name) => {
+    const n = String(name || "").trim();
+    if (!n) return;
+    setData && setData((d) => {
+      const known = new Set([...ASSET_CATEGORIES, ...((d.assetCategories) || [])].map((c) => String(c).toLowerCase()));
+      return known.has(n.toLowerCase()) ? d : { ...d, assetCategories: [...((d.assetCategories) || []), n] };
+    });
+    set("category", n);
+  };
   const computed = computeAssetRow(v);
   return (
-    <EntryModalShell title="Add Fixed Asset" submitLabel="Add asset" onCancel={onCancel}
+    <EntryModalShell title={initial && initial.sourceTransactionId ? "Admit Asset from Transaction" : "Add Fixed Asset"} submitLabel={initial && initial.sourceTransactionId ? "Save asset" : "Add asset"} onCancel={onCancel}
       onSubmit={() => onSubmit(computeAssetRow({ id: uid(), ...v }))}>
       <LabeledField label="Asset Name" wide><Field value={v.name} onChange={(x) => set("name", x)} placeholder="Delivery Van - Toyota Hiace" /></LabeledField>
       <LabeledField label="Asset Code"><Field value={v.code} onChange={(x) => set("code", x)} placeholder="FA-001" /></LabeledField>
-      <LabeledField label="Category"><Field type="select" options={ASSET_CATEGORIES} value={v.category} onChange={(x) => set("category", x)} /></LabeledField>
-      <LabeledField label="Acquisition Date"><Field type="date" value={v.acquisitionDate} onChange={(x) => set("acquisitionDate", x)} /></LabeledField>
+      <LabeledField label="Category"><Field type="combo" options={categoryOptions} value={v.category} onChange={(x) => set("category", x)} onAddNew={addCategory} addNewLabel="category" /></LabeledField>
+      <LabeledField label="Acquisition Date"><Field type="date" value={v.acquisitionDate} onChange={onAcqDate} /></LabeledField>
+      <LabeledField label="Depreciation Starting Date"><Field type="date" value={v.depreciationStartDate} onChange={(x) => { setDepStartTouched(true); set("depreciationStartDate", x); }} /></LabeledField>
       <LabeledField label="Cost"><Field type="number" align="right" value={v.cost} onChange={(x) => set("cost", x)} /></LabeledField>
       <LabeledField label="Salvage Value"><Field type="number" align="right" value={v.salvageValue} onChange={(x) => set("salvageValue", x)} /></LabeledField>
       <LabeledField label="Useful Life (Years)"><Field type="number" align="right" value={v.usefulLifeYears} onChange={(x) => set("usefulLifeYears", x)} /></LabeledField>
+      <LabeledField label="Opening Accum. Depreciation"><Field type="number" align="right" value={v.openingAccumulatedDep} onChange={(x) => set("openingAccumulatedDep", x)} /></LabeledField>
       <LabeledField label="Asset Account"><Field type="combo" options={assetAcctOptions} value={v.assetAccount} onChange={(x) => set("assetAccount", x)} /></LabeledField>
       <LabeledField label="Accumulated Depreciation Account"><Field type="combo" options={assetAcctOptions} value={v.accumDepAccount} onChange={(x) => set("accumDepAccount", x)} /></LabeledField>
       <LabeledField label="Depreciation Expense Account"><Field type="combo" options={expAcctOptions} value={v.depExpenseAccount} onChange={(x) => set("depExpenseAccount", x)} /></LabeledField>
-      <LabeledField label="Status"><Field type="select" options={["Active","Disposed"]} value={v.status} onChange={(x) => set("status", x)} /></LabeledField>
-      <ComputedPreview items={[["Monthly Depreciation", fmt(computed.monthlyDep)], ["Book Value (at start)", fmt(v.cost)]]} />
+      <LabeledField label="Status"><Field type="select" options={ASSET_STATUSES} value={v.status} onChange={(x) => set("status", x)} /></LabeledField>
+      <ComputedPreview items={[["Monthly Depreciation", fmt(computed.monthlyDep)], ["Opening Accum. Dep.", fmt(v.openingAccumulatedDep)], ["Book Value (at start)", fmt(computed.bookValue)]]} />
     </EntryModalShell>
   );
 }
+
+// A Fixed-Assets purchase can be posted through Purchase Journal, Cash Disbursements or a General
+// Journal entry without also being tracked here — this scans those journals for debits to a
+// Fixed-Assets-type COA account that no ledger asset references and that haven't been dismissed.
+function findUnreconciledFixedAssetTransactions(data) {
+  const fixedAssetCodes = new Set(
+    (data.coa || []).filter((a) => a.accountType === "Fixed Assets" && !/contra/i.test(a.notes || "")).map((a) => a.code)
+  );
+  if (fixedAssetCodes.size === 0) return [];
+  const trackedTxnIds = new Set((data.fixedAssets || []).filter((a) => a.sourceTransactionId).map((a) => a.sourceTransactionId));
+  const ignoredIds = new Set(data.ignoredAssetCandidates || []);
+  const out = [];
+  const consider = (sourceJournal, sourceTransactionId, date, amount, description, party) => {
+    if (!sourceTransactionId || trackedTxnIds.has(sourceTransactionId) || ignoredIds.has(sourceTransactionId)) return;
+    out.push({ sourceJournal, sourceTransactionId, date: date || "", amount: round2(amount), description: description || "", party: party || "" });
+  };
+  (data.purchases || []).forEach((r) => {
+    if (fixedAssetCodes.has(r.coaCode)) consider("purchases", r.id, r.date, (num(r.vatable) + num(r.nonvat)) || num(r.total), r.desc, r.supplier);
+  });
+  (data.disbursements || []).forEach((r) => {
+    if (fixedAssetCodes.has(r.coaCode)) consider("disbursements", r.id, r.date, num(r.amount), r.desc, r.vendor);
+  });
+  (data.generalJournal || []).forEach((jv) => {
+    (jv.lines || []).forEach((line, i) => {
+      if (fixedAssetCodes.has(line.account) && num(line.debit) > 0) consider("generaljournal", `${jv.id}-${i}`, jv.date, num(line.debit), jv.particulars, "");
+    });
+  });
+  return out;
+}
+const SOURCE_JOURNAL_LABELS = { purchases: "Purchase Journal", disbursements: "Cash Disbursements", generaljournal: "General Journal" };
 
 function FixedAssetLedgerPage({ data, setData }) {
   const coaByCode = useMemo(() => Object.fromEntries(data.coa.map((a) => [a.code, a])), [data.coa]);
   const assetAcctOptions = data.coa.filter((a) => a.type === "Asset").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const expAcctOptions = data.coa.filter((a) => a.type === "Expense").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
+  const categoryOptions = assetCategoryOptions(data);
   const [modalOpen, setModalOpen] = useState(false);
+  const [admitCandidate, setAdmitCandidate] = useState(null); // reconciliation candidate being admitted
   const assets = useMemo(() => (data.fixedAssets || []).map(computeAssetRow), [data.fixedAssets]);
 
   const update = (id, patch) => setData((d) => ({ ...d, fixedAssets: d.fixedAssets.map((r) => r.id === id ? computeAssetRow({ ...r, ...patch }) : r) }));
   const onDelete = (id) => setData((d) => ({ ...d, fixedAssets: d.fixedAssets.filter((r) => r.id !== id) }));
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
+  const importHook = useJournalImport("fixedassets", data, ({ newRows }) => setData((d) => ({ ...d, fixedAssets: [...(d.fixedAssets || []), ...newRows] })));
+  const exportHook = useJournalExport("fixedassets", data, assets, coaByCode);
+
+  const candidates = useMemo(() => findUnreconciledFixedAssetTransactions(data), [data]);
+  const onIgnoreCandidate = (txnId) => setData((d) => ({ ...d, ignoredAssetCandidates: [...(d.ignoredAssetCandidates || []), txnId] }));
+
   const [postMonth, setPostMonth] = useState(new Date().getMonth() + 1);
   const [postYear, setPostYear] = useState(new Date().getFullYear());
   const periodKey = `${postYear}-${pad2(postMonth)}`;
   const periodLabel = `${MONTHS[postMonth - 1]} ${postYear}`;
 
+  // Postable years come from each asset's own Depreciation Starting Date through the current year —
+  // not a fixed global range, so an asset acquired years before adopting Haki isn't blocked.
+  const postYearOptions = useMemo(() => {
+    const cur = new Date().getFullYear();
+    const yrs = new Set([cur - 1, cur, cur + 1]);
+    assets.forEach((a) => {
+      const d = parseAppDate(assetDepStartDate(a));
+      if (d) for (let y = d.getFullYear(); y <= cur; y++) yrs.add(y);
+      (a.postedPeriods || []).forEach((k) => { const y = parseInt(String(k).slice(0, 4), 10); if (!isNaN(y)) yrs.add(y); });
+    });
+    return [...yrs].sort((x, y) => x - y);
+  }, [assets]);
+
   const dueThisPeriod = useMemo(() => {
     return assets.filter((a) => {
-      if (a.status === "Disposed") return false;
+      if (a.status !== "Active") return false; // Fully Depreciated / Disposed are not postable
       if (a.fullyDepreciated) return false;
       if (a.monthlyDep <= 0) return false;
-      const acqDate = parseAppDate(a.acquisitionDate);
-      if (!acqDate) return false;
-      const acqKey = `${acqDate.getFullYear()}-${pad2(acqDate.getMonth() + 1)}`;
-      if (periodKey < acqKey) return false; // can't depreciate before acquisition
+      const startDate = parseAppDate(assetDepStartDate(a));
+      if (!startDate) return false;
+      const startKey = `${startDate.getFullYear()}-${pad2(startDate.getMonth() + 1)}`;
+      if (periodKey < startKey) return false; // can't depreciate before the depreciation start date
       if ((a.postedPeriods || []).includes(periodKey)) return false; // already posted this period
       return true;
     });
@@ -6908,9 +7031,10 @@ function FixedAssetLedgerPage({ data, setData }) {
       ...Object.entries(expByAccount).map(([account, debit]) => ({ id: uid(), account, debit, credit: 0 })),
       ...Object.entries(accumByAccount).map(([account, credit]) => ({ id: uid(), account, debit: 0, credit })),
     ];
-    const jvNo = `JV-${String(data.generalJournal.length + 1).padStart(3, "0")}`;
     const monthEndDate = monthEnd(postYear, postMonth - 1);
-    const jv = { id: uid(), jvNo, date: `${pad2(postMonth)}/${pad2(monthEndDate.getDate())}/${postYear}`, particulars: `Monthly depreciation — ${periodLabel}`, lines };
+    const jvDate = `${pad2(postMonth)}/${pad2(monthEndDate.getDate())}/${postYear}`;
+    const jvNo = suggestNextJvNo(data.generalJournal, jvDate);
+    const jv = { id: uid(), jvNo, date: jvDate, particulars: `Monthly depreciation — ${periodLabel}`, lines };
     setData((d) => ({
       ...d,
       generalJournal: [...d.generalJournal, jv],
@@ -6920,51 +7044,90 @@ function FixedAssetLedgerPage({ data, setData }) {
     setTimeout(() => setPostStatus(null), 5000);
   };
 
-  const totals = assets.reduce((a, r) => ({ cost: a.cost + num(r.cost), accumDep: a.accumDep + num(r.accumulatedDep), bookValue: a.bookValue + num(r.bookValue) }), { cost: 0, accumDep: 0, bookValue: 0 });
+  const totals = assets.reduce((a, r) => ({
+    cost: a.cost + num(r.cost), opening: a.opening + num(r.openingAccumulatedDep),
+    monthly: a.monthly + num(r.monthlyDep), accumDep: a.accumDep + num(r.accumulatedDep), bookValue: a.bookValue + num(r.bookValue),
+  }), { cost: 0, opening: 0, monthly: 0, accumDep: 0, bookValue: 0 });
 
   return (
     <div>
       <SectionHeader icon={Landmark} title="Fixed Asset Ledger" subtitle="Straight-line depreciation, computed automatically — post it to the General Journal whenever you're ready."
-        right={<AddRowBtn onClick={() => setModalOpen(true)}>Add asset</AddRowBtn>} />
+        right={<div className="header-actions"><ImportExportBar journalKey="fixedassets" data={data} importHook={importHook} /><ExportBar exportHook={exportHook} /><AddRowBtn onClick={() => setModalOpen(true)}>Add asset</AddRowBtn></div>} />
+      <ImportStatus status={importHook.status} />
+      <ExportStatus status={exportHook.status} />
+
+      {candidates.length > 0 && (
+        <div className="callout" style={{ display: "block" }}>
+          <div className="callout-title" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <Info size={16} /> {candidates.length} fixed-asset transaction{candidates.length === 1 ? "" : "s"} not yet in this ledger
+          </div>
+          <div className="callout-body" style={{ marginBottom: 10 }}>
+            These postings hit a Fixed Assets account but aren't tracked as an asset here, so the Balance Sheet's Fixed Assets line and this ledger's total book value can drift apart. Admit each one as a tracked asset, or ignore it (e.g. a miscoded expense).
+          </div>
+          <table className="ledger-table report-table">
+            <thead><tr><th>Source</th><th>Date</th><th>Description</th><th className="num-head">Amount</th><th style={{width:150}}></th></tr></thead>
+            <tbody>
+              {candidates.map((c) => (
+                <tr key={c.sourceTransactionId}>
+                  <td>{SOURCE_JOURNAL_LABELS[c.sourceJournal] || c.sourceJournal}{c.party ? ` · ${c.party}` : ""}</td>
+                  <td>{c.date}</td>
+                  <td>{c.description || "—"}</td>
+                  <td className="num">{fmt(c.amount)}</td>
+                  <td className="text-center">
+                    <button className="io-btn accent" onClick={() => setAdmitCandidate(c)}>Admit</button>
+                    <button className="io-btn" onClick={() => onIgnoreCandidate(c.sourceTransactionId)}>Ignore</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div className="ledger-wrap">
         <div className="table-scroll">
           <table className="ledger-table">
             <thead><tr>
               <th style={{minWidth:190}}>Asset Name</th><th style={{minWidth:90}}>Code</th><th style={{minWidth:160}}>Category</th>
-              <th style={{minWidth:120}}>Acquisition Date</th><th style={{minWidth:110}} className="num-head">Cost</th>
+              <th style={{minWidth:120}}>Acquisition Date</th><th style={{minWidth:130}}>Dep. Starting Date</th><th style={{minWidth:110}} className="num-head">Cost</th>
               <th style={{minWidth:110}} className="num-head">Salvage Value</th><th style={{minWidth:90}} className="num-head">Life (Yrs)</th>
+              <th style={{minWidth:130}} className="num-head">Opening Accum. Dep.</th>
               <th style={{minWidth:110}} className="num-head">Monthly Dep.</th><th style={{minWidth:120}} className="num-head">Accum. Dep.</th>
               <th style={{minWidth:110}} className="num-head">Book Value</th>
               <th style={{minWidth:170}}>Asset Account</th><th style={{minWidth:200}}>Accum. Dep. Account</th><th style={{minWidth:190}}>Dep. Expense Account</th>
-              <th style={{minWidth:100}}>Status</th><th style={{width:36}}></th>
+              <th style={{minWidth:130}}>Status</th><th style={{width:36}}></th>
             </tr></thead>
             <tbody>
-              {assets.length === 0 && <tr><td colSpan={15} className="empty-row">No fixed assets yet — add your first one above.</td></tr>}
+              {assets.length === 0 && <tr><td colSpan={17} className="empty-row">No fixed assets yet — add your first one above.</td></tr>}
               {assets.map((r) => (
                 <tr key={r.id}>
                   <td><Field value={r.name} onChange={(v) => update(r.id, { name: v })} /></td>
                   <td><Field value={r.code} onChange={(v) => update(r.id, { code: v })} /></td>
-                  <td><Field type="select" options={ASSET_CATEGORIES} value={r.category} onChange={(v) => update(r.id, { category: v })} /></td>
+                  <td><Field type="combo" options={categoryOptions} value={r.category} onChange={(v) => update(r.id, { category: v })}
+                    onAddNew={(typed) => { const n = String(typed || "").trim(); if (!n) return; setData((d) => { const known = new Set([...ASSET_CATEGORIES, ...((d.assetCategories) || [])].map((c) => String(c).toLowerCase())); const withCat = known.has(n.toLowerCase()) ? d : { ...d, assetCategories: [...((d.assetCategories) || []), n] }; return { ...withCat, fixedAssets: withCat.fixedAssets.map((x) => x.id === r.id ? computeAssetRow({ ...x, category: n }) : x) }; }); }} addNewLabel="category" /></td>
                   <td><Field type="date" value={r.acquisitionDate} onChange={(v) => update(r.id, { acquisitionDate: v })} /></td>
+                  <td><Field type="date" value={r.depreciationStartDate || ""} onChange={(v) => update(r.id, { depreciationStartDate: v })} /></td>
                   <td><Field type="number" align="right" value={r.cost} onChange={(v) => update(r.id, { cost: v })} /></td>
                   <td><Field type="number" align="right" value={r.salvageValue} onChange={(v) => update(r.id, { salvageValue: v })} /></td>
                   <td><Field type="number" align="right" value={r.usefulLifeYears} onChange={(v) => update(r.id, { usefulLifeYears: v })} /></td>
+                  <td><Field type="number" align="right" value={r.openingAccumulatedDep || 0} onChange={(v) => update(r.id, { openingAccumulatedDep: v })} /></td>
                   <td><ReadCell align="right">{fmt(r.monthlyDep)}</ReadCell></td>
                   <td><ReadCell align="right">{fmt(r.accumulatedDep)}</ReadCell></td>
                   <td><ReadCell align="right">{fmt(r.bookValue)}</ReadCell></td>
                   <td><Field type="combo" options={assetAcctOptions} value={r.assetAccount} onChange={(v) => update(r.id, { assetAccount: v })} /></td>
                   <td><Field type="combo" options={assetAcctOptions} value={r.accumDepAccount} onChange={(v) => update(r.id, { accumDepAccount: v })} /></td>
                   <td><Field type="combo" options={expAcctOptions} value={r.depExpenseAccount} onChange={(v) => update(r.id, { depExpenseAccount: v })} /></td>
-                  <td><Field type="select" options={["Active","Disposed"]} value={r.status} onChange={(v) => update(r.id, { status: v })} /></td>
+                  <td><Field type="select" options={ASSET_STATUSES} value={r.status} onChange={(v) => update(r.id, { status: v })} /></td>
                   <td className="text-center"><DelBtn onClick={() => setConfirmDeleteId(r.id)} /></td>
                 </tr>
               ))}
             </tbody>
             {assets.length > 0 && (
               <tfoot><tr>
-                <td colSpan={4} className="totals-label">Totals</td>
+                <td colSpan={5} className="totals-label">Totals</td>
                 <td className="num">{fmt(totals.cost)}</td><td colSpan={2}></td>
-                <td></td><td className="num">{fmt(totals.accumDep)}</td><td className="num">{fmt(totals.bookValue)}</td>
+                <td className="num">{fmt(totals.opening)}</td><td className="num">{fmt(totals.monthly)}</td>
+                <td className="num">{fmt(totals.accumDep)}</td><td className="num">{fmt(totals.bookValue)}</td>
                 <td colSpan={5}></td>
               </tr></tfoot>
             )}
@@ -6976,7 +7139,7 @@ function FixedAssetLedgerPage({ data, setData }) {
       <div className="form-card">
         <div className="form-grid">
           <LabeledField label="Month"><Field type="select" options={MONTHS.map((m, i) => ({ value: i + 1, label: m }))} value={postMonth} onChange={(v) => setPostMonth(Number(v))} /></LabeledField>
-          <LabeledField label="Year"><Field type="select" options={getAvailableYears(data)} value={postYear} onChange={(v) => setPostYear(Number(v))} /></LabeledField>
+          <LabeledField label="Year"><Field type="select" options={postYearOptions} value={postYear} onChange={(v) => setPostYear(Number(v))} /></LabeledField>
         </div>
       </div>
       {missingAccounts.length > 0 && (
@@ -7021,8 +7184,21 @@ function FixedAssetLedgerPage({ data, setData }) {
       )}
 
       {modalOpen && (
-        <FixedAssetEntryModal data={data} onCancel={() => setModalOpen(false)}
+        <FixedAssetEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
           onSubmit={(row) => { setData((d) => ({ ...d, fixedAssets: [...(d.fixedAssets || []), row] })); setModalOpen(false); }} />
+      )}
+      {admitCandidate && (
+        <FixedAssetEntryModal data={data} setData={setData}
+          initial={{
+            name: admitCandidate.description,
+            cost: admitCandidate.amount,
+            acquisitionDate: toMDY(admitCandidate.date),
+            depreciationStartDate: toMDY(admitCandidate.date),
+            sourceJournal: admitCandidate.sourceJournal,
+            sourceTransactionId: admitCandidate.sourceTransactionId,
+          }}
+          onCancel={() => setAdmitCandidate(null)}
+          onSubmit={(row) => { setData((d) => ({ ...d, fixedAssets: [...(d.fixedAssets || []), row] })); setAdmitCandidate(null); }} />
       )}
       {confirmDeleteId && (
         <ConfirmModal title="Delete asset" danger confirmLabel="Delete"
