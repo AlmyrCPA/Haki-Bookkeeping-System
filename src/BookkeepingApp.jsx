@@ -2878,10 +2878,32 @@ function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
   );
 }
 
+// Default JV No. format: JV-YYYY-001, where YYYY is the year of the entry's own Date and the
+// trailing number is a chronological sequence within that year (one past the highest already used).
+// This is a suggestion only — the field stays editable.
+function suggestNextJvNo(generalJournal, dateStr) {
+  const d = parseAppDate(dateStr);
+  const year = d ? d.getFullYear() : new Date().getFullYear();
+  const prefix = `JV-${year}-`;
+  const existingSeqs = (generalJournal || [])
+    .filter((jv) => (jv.jvNo || "").startsWith(prefix))
+    .map((jv) => parseInt(jv.jvNo.slice(prefix.length), 10))
+    .filter((n) => !isNaN(n));
+  const next = existingSeqs.length ? Math.max(...existingSeqs) + 1 : 1;
+  return `${prefix}${String(next).padStart(3, "0")}`;
+}
+
 function JournalVoucherModal({ data, onCancel, onSubmit, nextJvNo, initial, title, submitLabel }) {
   const acctOptions = data.coa.map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
-  const [jvNo, setJvNo] = useState(initial?.jvNo || nextJvNo);
   const [date, setDate] = useState(initial?.date || todayMDY());
+  const [jvNo, setJvNo] = useState(initial?.jvNo || nextJvNo || suggestNextJvNo(data.generalJournal, initial?.date || todayMDY()));
+  // Auto-fill the JV No. from the entry's date until the user types over it directly. Once they've
+  // edited the field, stop re-suggesting so an externally-assigned number isn't clobbered.
+  const [jvNoTouched, setJvNoTouched] = useState(false);
+  useEffect(() => {
+    if (jvNoTouched || initial?.jvNo) return;
+    setJvNo(suggestNextJvNo(data.generalJournal, date));
+  }, [date, jvNoTouched]); // eslint-disable-line react-hooks/exhaustive-deps
   const [particulars, setParticulars] = useState(initial?.particulars || "");
   const [lines, setLines] = useState(
     initial?.lines && initial.lines.length
@@ -2897,7 +2919,7 @@ function JournalVoucherModal({ data, onCancel, onSubmit, nextJvNo, initial, titl
   return (
     <EntryModalShell title={title || "Add Journal Voucher"} submitLabel={submitLabel || "Add voucher"} onCancel={onCancel}
       onSubmit={() => onSubmit({ id: uid(), jvNo, date, particulars, lines: lines.map((l) => ({ id: uid(), account: l.account, debit: num(l.debit), credit: num(l.credit) })) })}>
-      <LabeledField label="JV No."><Field value={jvNo} onChange={setJvNo} placeholder="JV-001" /></LabeledField>
+      <LabeledField label="JV No."><Field value={jvNo} onChange={(v) => { setJvNo(v); setJvNoTouched(true); }} placeholder="JV-2026-001" /></LabeledField>
       <LabeledField label="Date"><Field type="date" value={date} onChange={setDate} /></LabeledField>
       <LabeledField label="Particulars" wide><Field value={particulars} onChange={setParticulars} placeholder="Particulars / description of entry" /></LabeledField>
       <div className="modal-lines">
@@ -3866,7 +3888,7 @@ function GeneralJournalPage({ data, setData }) {
       )}
 
       {modalOpen && (
-        <JournalVoucherModal data={data} nextJvNo={`JV-${String(data.generalJournal.length + 1).padStart(3, "0")}`}
+        <JournalVoucherModal data={data} nextJvNo={suggestNextJvNo(data.generalJournal, todayMDY())}
           onCancel={() => setModalOpen(false)}
           onSubmit={(jv) => { setData((d) => ({ ...d, generalJournal: [...d.generalJournal, jv] })); setModalOpen(false); }} />
       )}
@@ -3874,7 +3896,7 @@ function GeneralJournalPage({ data, setData }) {
         <JournalPreviewModal voucher={previewVoucher} coaByCode={coaByCode} onClose={() => setPreviewVoucher(null)} onCopy={onMakeCopy} />
       )}
       {copySource && (
-        <JournalVoucherModal data={data} nextJvNo={`JV-${String(data.generalJournal.length + 1).padStart(3, "0")}`}
+        <JournalVoucherModal data={data} nextJvNo={suggestNextJvNo(data.generalJournal, todayMDY())}
           initial={{ date: todayMDY(), particulars: copySource.particulars, lines: copySource.lines }}
           title={`Copy of ${copySource.jvNo || "Journal Entry"}`} submitLabel="Post"
           onCancel={() => setCopySource(null)} onSubmit={onPostCopy} />
