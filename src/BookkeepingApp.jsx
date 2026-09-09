@@ -224,6 +224,8 @@ const NAV = [
     { key: "trial", label: "Trial Balance", icon: ClipboardList },
     { key: "income", label: "Income Statement", icon: TrendingUp },
     { key: "balance", label: "Balance Sheet", icon: Landmark },
+    { key: "apaging", label: "AP Aging", icon: ClipboardList },
+    { key: "araging", label: "AR Aging", icon: ClipboardList },
   ]},
   { group: "Tax Compliance", items: [
     { key: "importation", label: "Importation Ledger", icon: ArrowDownToLine },
@@ -2145,6 +2147,8 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
           {page === "trial" && <TrialBalancePage data={data} postings={postings} coaMap={coaMap} />}
           {page === "income" && <IncomeStatementPage data={data} setData={setData} postings={postings} coaMap={coaMap} />}
           {page === "balance" && <BalanceSheetPage data={data} postings={postings} coaMap={coaMap} />}
+          {page === "apaging" && <AgingReportPage data={data} side="AP" />}
+          {page === "araging" && <AgingReportPage data={data} side="AR" />}
           {page === "importation" && <ImportationLedgerPage data={data} setData={setData} />}
           {page === "slspi" && <SLSPIPage data={data} />}
           {page === "qap" && <QAPPage data={data} />}
@@ -2792,15 +2796,16 @@ function PurchaseEntryModal({ data, setData, onCancel, onSubmit }) {
 }
 
 function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), tin: "", vendor: "", cvNo: "", desc: "", atc: "", atcRate: 0, amount: 0, bankAccount: "Cash on Hand", coaCode: "6170" });
+  const [v, setV] = useState({ date: todayMDY(), tin: "", vendor: "", cvNo: "", desc: "", atc: "", atcRate: 0, amount: 0, bankAccount: "Cash on Hand", coaCode: "6170", appliedToPurchaseId: "" });
   const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
   const acctOptions = data.coa.filter((a) => a.type === "Expense" || a.type === "Asset" || a.type === "Liability").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const suppOptions = data.suppliers.map((s) => s.name).filter(Boolean);
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
+  const invoiceOptions = useMemo(() => openInvoiceOptions(AGING_SIDES.AP, data, v.vendor), [data, v.vendor]);
   const [quickAdd, setQuickAdd] = useState(null);
   const onSupplier = (name) => {
     const s = data.suppliers.find((x) => x.name.toLowerCase() === (name || "").toLowerCase());
-    setV((p) => ({ ...p, vendor: name, ...(s ? { tin: s.tin } : {}) }));
+    setV((p) => ({ ...p, vendor: name, appliedToPurchaseId: "", ...(s ? { tin: s.tin } : {}) }));
   };
   const onQuickAddSubmit = (supplier) => {
     setData((d) => ({ ...d, suppliers: [...d.suppliers, supplier].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })) }));
@@ -2826,6 +2831,9 @@ function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
       <LabeledField label="Amount"><Field type="number" align="right" value={v.amount} onChange={(x) => set("amount", x)} /></LabeledField>
       <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} /></LabeledField>
       <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
+      {invoiceOptions.length > 1 && (
+        <LabeledField label="Applied to Invoice" wide><Field type="combo" options={invoiceOptions} value={v.appliedToPurchaseId} onChange={(x) => set("appliedToPurchaseId", x)} /></LabeledField>
+      )}
       <ComputedPreview items={[["EWT", fmt(computed.ewt)], ["Net Amount", fmt(computed.net)]]} />
       {quickAdd !== null && (
         <QuickAddPartyModal kind="supplier" initialName={quickAdd} onCancel={() => setQuickAdd(null)} onSubmit={onQuickAddSubmit} />
@@ -2835,10 +2843,11 @@ function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
 }
 
 function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), from: "", orNo: "", desc: "", atc: "", atcRate: 0, amount: 0, cwt: 0, bankAccount: "Cash on Hand", coaCode: "1200" });
+  const [v, setV] = useState({ date: todayMDY(), from: "", orNo: "", desc: "", atc: "", atcRate: 0, amount: 0, cwt: 0, bankAccount: "Cash on Hand", coaCode: "1200", appliedToSalesId: "" });
   const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
   const acctOptions = data.coa.map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const custOptions = data.customers.map((c) => c.name).filter(Boolean);
+  const invoiceOptions = useMemo(() => openInvoiceOptions(AGING_SIDES.AR, data, v.from), [data, v.from]);
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
   const [quickAdd, setQuickAdd] = useState(null);
   const onQuickAddSubmit = (customer) => {
@@ -2859,7 +2868,7 @@ function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
     <EntryModalShell title="Add Receipt" submitLabel="Add receipt" onCancel={onCancel}
       onSubmit={() => onSubmit(computeReceiptRow({ id: uid(), ...v }))}>
       <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
-      <LabeledField label="Received From"><Field type="combo" options={custOptions} value={v.from} onChange={(x) => set("from", x)}
+      <LabeledField label="Received From"><Field type="combo" options={custOptions} value={v.from} onChange={(x) => setV((p) => ({ ...p, from: x, appliedToSalesId: "" }))}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="customer" /></LabeledField>
       <LabeledField label="OR/Ref No."><Field value={v.orNo} onChange={(x) => set("orNo", x)} placeholder="OR-001" /></LabeledField>
       <LabeledField label="Description" wide><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
@@ -2869,6 +2878,9 @@ function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
       <LabeledField label="CWT"><Field type="number" align="right" value={v.cwt} onChange={(x) => set("cwt", x)} /></LabeledField>
       <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} /></LabeledField>
       <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
+      {invoiceOptions.length > 1 && (
+        <LabeledField label="Applied to Invoice" wide><Field type="combo" options={invoiceOptions} value={v.appliedToSalesId} onChange={(x) => set("appliedToSalesId", x)} /></LabeledField>
+      )}
       <ComputedPreview items={[["Net Amount", fmt(computed.net)]]} />
       <div className="qf-hint">CWT auto-fills from ATC × Amount, but stays fully editable — type over it (formulas work too) for non-VAT books or special cases.</div>
       {quickAdd !== null && (
@@ -3576,10 +3588,11 @@ function DisbursementsPage({ data, setData }) {
               <th style={{minWidth:200}}>Description</th><th style={{minWidth:180}}>ATC</th><th style={{minWidth:80}} className="num-head">Rate</th>
               <th style={{minWidth:110}} className="num-head">Amount</th>
               <th style={{minWidth:100}} className="num-head">EWT</th><th style={{minWidth:110}} className="num-head">Net Amount</th>
-              <th style={{minWidth:130}}>Bank Account</th><th style={{minWidth:190}}>Account</th><th style={{width:36}}></th>
+              <th style={{minWidth:130}}>Bank Account</th><th style={{minWidth:190}}>Account</th>
+              <th style={{minWidth:230}}>Applied to Invoice</th><th style={{width:36}}></th>
             </tr></thead>
             <tbody>
-              {filteredRows.length === 0 && <tr><td colSpan={14} className="empty-row">{emptyMsg}</td></tr>}
+              {filteredRows.length === 0 && <tr><td colSpan={15} className="empty-row">{emptyMsg}</td></tr>}
               {pg.pageRows.map((r) => (
                 <tr key={r.id} className={sel.selected.has(r.id) ? "row-selected" : ""}>
                   <td className="text-center"><RowCheckbox id={r.id} selected={sel.selected} toggle={sel.toggle} /></td>
@@ -3596,13 +3609,14 @@ function DisbursementsPage({ data, setData }) {
                   <td><ReadCell align="right">{fmt(r.net)}</ReadCell></td>
                   <td><Field type="select" options={BANK_ACCOUNTS} value={r.bankAccount} onChange={(v) => update(r.id, { bankAccount: v })} /></td>
                   <td><Field type="combo" options={acctOptions} value={r.coaCode} onChange={(v) => update(r.id, { coaCode: v })} /></td>
+                  <td><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AP, data, r.vendor, r.appliedToPurchaseId)} value={r.appliedToPurchaseId || ""} onChange={(v) => update(r.id, { appliedToPurchaseId: v })} /></td>
                   <td className="text-center"><DelBtn onClick={() => onDelete(r.id)} /></td>
                 </tr>
               ))}
             </tbody>
             {filteredRows.length > 0 && (
               <tfoot><tr><td colSpan={8} className="totals-label">Totals</td>
-                <td className="num">{fmt(totals.amount)}</td><td className="num">{fmt(totals.ewt)}</td><td className="num">{fmt(totals.net)}</td><td colSpan={3}></td>
+                <td className="num">{fmt(totals.amount)}</td><td className="num">{fmt(totals.ewt)}</td><td className="num">{fmt(totals.net)}</td><td colSpan={4}></td>
               </tr></tfoot>
             )}
           </table>
@@ -3701,15 +3715,16 @@ function ReceiptsPage({ data, setData }) {
               <th style={{minWidth:200}}>Description</th><th style={{minWidth:180}}>ATC</th><th style={{minWidth:80}} className="num-head">Rate</th>
               <th style={{minWidth:110}} className="num-head">Amount</th>
               <th style={{minWidth:100}} className="num-head">CWT</th><th style={{minWidth:110}} className="num-head">Net Amount</th>
-              <th style={{minWidth:130}}>Bank Account</th><th style={{minWidth:190}}>Account</th><th style={{width:36}}></th>
+              <th style={{minWidth:130}}>Bank Account</th><th style={{minWidth:190}}>Account</th>
+              <th style={{minWidth:230}}>Applied to Invoice</th><th style={{width:36}}></th>
             </tr></thead>
             <tbody>
-              {filteredRows.length === 0 && <tr><td colSpan={13} className="empty-row">{emptyMsg}</td></tr>}
+              {filteredRows.length === 0 && <tr><td colSpan={14} className="empty-row">{emptyMsg}</td></tr>}
               {pg.pageRows.map((r) => (
                 <tr key={r.id} className={sel.selected.has(r.id) ? "row-selected" : ""}>
                   <td className="text-center"><RowCheckbox id={r.id} selected={sel.selected} toggle={sel.toggle} /></td>
                   <td><Field type="date" value={r.date} onChange={(v) => update(r.id, { date: v })} /></td>
-                  <td><Field type="combo" options={custOptions} value={r.from} onChange={(v) => update(r.id, { from: v })}
+                  <td><Field type="combo" options={custOptions} value={r.from} onChange={(v) => update(r.id, { from: v, appliedToSalesId: "" })}
                     onAddNew={(typed) => setQuickAddCustomer({ rowId: r.id, typedName: typed })} addNewLabel="customer" /></td>
                   <td><Field value={r.orNo} onChange={(v) => update(r.id, { orNo: v })} placeholder="OR-001" /></td>
                   <td><Field value={r.desc} onChange={(v) => update(r.id, { desc: v })} /></td>
@@ -3720,13 +3735,14 @@ function ReceiptsPage({ data, setData }) {
                   <td><ReadCell align="right">{fmt(r.net)}</ReadCell></td>
                   <td><Field type="select" options={BANK_ACCOUNTS} value={r.bankAccount} onChange={(v) => update(r.id, { bankAccount: v })} /></td>
                   <td><Field type="combo" options={acctOptions} value={r.coaCode} onChange={(v) => update(r.id, { coaCode: v })} /></td>
+                  <td><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AR, data, r.from, r.appliedToSalesId)} value={r.appliedToSalesId || ""} onChange={(v) => update(r.id, { appliedToSalesId: v })} /></td>
                   <td className="text-center"><DelBtn onClick={() => onDelete(r.id)} /></td>
                 </tr>
               ))}
             </tbody>
             {filteredRows.length > 0 && (
               <tfoot><tr><td colSpan={7} className="totals-label">Totals</td>
-                <td className="num">{fmt(totals.amount)}</td><td className="num">{fmt(totals.cwt)}</td><td className="num">{fmt(totals.net)}</td><td colSpan={3}></td>
+                <td className="num">{fmt(totals.amount)}</td><td className="num">{fmt(totals.cwt)}</td><td className="num">{fmt(totals.net)}</td><td colSpan={4}></td>
               </tr></tfoot>
             )}
           </table>
@@ -4599,6 +4615,172 @@ function BalanceSheetPage({ data, postings, coaMap }) {
 
       <div className={"check-strip" + (Math.abs(result.check) < 0.01 ? " ok" : " bad")}>
         {Math.abs(result.check) < 0.01 ? "✓ Balance sheet balances." : `⚠ Out of balance by ${fmt(result.check)} — check journal entries.`}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== AP / AR AGING ============================== */
+
+// A payment row (Cash Disbursement / Cash Receipt) links to the invoice it settles via
+// appliedToPurchaseId / appliedToSalesId. An invoice's outstanding balance is its recorded total
+// minus every payment applied to it — partial/installment payments need no special handling since
+// multiple payment rows can point at the same invoice.
+function paymentsAppliedTo(invoiceId, payments, refField) {
+  if (!invoiceId) return 0;
+  return (payments || []).reduce((s, p) => s + (p[refField] === invoiceId ? num(p.amount) : 0), 0);
+}
+function getOutstandingBalance(invoiceRow, payments, refField) {
+  return round2(num(invoiceRow.total) - paymentsAppliedTo(invoiceRow.id, payments, refField));
+}
+function agingBucket(ageDays) {
+  return ageDays <= 30 ? "Current" : ageDays <= 60 ? "31–60" : ageDays <= 90 ? "61–90" : "91+";
+}
+const AGING_BUCKETS = ["Current", "31–60", "61–90", "91+"];
+
+const AGING_SIDES = {
+  AP: {
+    title: "AP Aging", noun: "payables", partyLabel: "Supplier",
+    invoicesKey: "purchases", paymentsKey: "disbursements", refField: "appliedToPurchaseId",
+    partyField: "supplier", invNoField: "invNo",
+  },
+  AR: {
+    title: "AR Aging", noun: "receivables", partyLabel: "Customer",
+    invoicesKey: "sales", paymentsKey: "receipts", refField: "appliedToSalesId",
+    partyField: "customer", invNoField: "siNo",
+  },
+};
+
+// Options for a payment row's "Applied to Invoice" combo: that party's credit-terms invoices that
+// still have an outstanding balance, plus (for inline editing) whatever invoice the row already
+// references even if it's since been fully paid.
+function openInvoiceOptions(cfg, data, partyName, keepId) {
+  const party = (partyName || "").trim().toLowerCase();
+  const opts = (data[cfg.invoicesKey] || [])
+    .filter((inv) => inv.terms === "Credit" && (inv[cfg.partyField] || "").trim().toLowerCase() === party && party !== "")
+    .map((inv) => ({ inv, outstanding: getOutstandingBalance(inv, data[cfg.paymentsKey], cfg.refField) }))
+    .filter((x) => x.outstanding > 0.01 || x.inv.id === keepId)
+    .map(({ inv, outstanding }) => ({
+      value: inv.id,
+      label: `${inv[cfg.invNoField] || "—"} — ${inv.date} — ${fmtPlain(num(inv.total))} total, ${fmtPlain(outstanding)} outstanding`,
+    }));
+  return [{ value: "", label: "— not settling an invoice —" }, ...opts];
+}
+
+// Open invoices for aging: credit-terms only (a cash invoice is settled at point of sale, not a
+// payable/receivable), dated on/before the as-of date, with a positive outstanding balance.
+function buildAgingRows(cfg, data, asOfDate) {
+  const payments = data[cfg.paymentsKey] || [];
+  return (data[cfg.invoicesKey] || [])
+    .map((inv) => {
+      if (inv.terms !== "Credit") return null;
+      const d = parseAppDate(inv.date);
+      if (!d || d > asOfDate) return null;
+      const total = round2(num(inv.total));
+      const paid = round2(paymentsAppliedTo(inv.id, payments, cfg.refField));
+      const outstanding = round2(total - paid);
+      if (outstanding <= 0.01) return null;
+      const ageDays = Math.max(0, Math.floor((asOfDate - d) / 86400000));
+      return {
+        id: inv.id, party: (inv[cfg.partyField] || "—").trim() || "—", invNo: inv[cfg.invNoField] || "—",
+        date: inv.date, total, paid, outstanding, ageDays, bucket: agingBucket(ageDays),
+      };
+    })
+    .filter(Boolean);
+}
+
+function AgingReportPage({ data, side }) {
+  const cfg = AGING_SIDES[side];
+  const [asOf, setAsOf] = useState(todayMDY());
+  const asOfDate = useMemo(() => parseAppDate(asOf) || new Date(), [asOf]);
+  const rows = useMemo(() => buildAgingRows(cfg, data, asOfDate), [cfg, data, asOfDate]);
+
+  const groups = useMemo(() => {
+    const m = new Map();
+    rows.forEach((r) => { if (!m.has(r.party)) m.set(r.party, []); m.get(r.party).push(r); });
+    return [...m.entries()]
+      .map(([party, rs]) => ({
+        party,
+        rows: rs.slice().sort((a, b) => b.ageDays - a.ageDays),
+        subtotal: rs.reduce((a, r) => ({ total: a.total + r.total, paid: a.paid + r.paid, outstanding: a.outstanding + r.outstanding }), { total: 0, paid: 0, outstanding: 0 }),
+      }))
+      .sort((a, b) => a.party.localeCompare(b.party, undefined, { sensitivity: "base" }));
+  }, [rows]);
+
+  const grand = rows.reduce((a, r) => ({ total: a.total + r.total, paid: a.paid + r.paid, outstanding: a.outstanding + r.outstanding }), { total: 0, paid: 0, outstanding: 0 });
+  const bucketTotals = AGING_BUCKETS.map((b) => ({ b, amount: round2(rows.filter((r) => r.bucket === b).reduce((s, r) => s + r.outstanding, 0)) }));
+
+  return (
+    <div className="pnl-shell">
+      <div className="pnl-toolbar">
+        <div className="pnl-toolbar-top">
+          <h1>{cfg.title}</h1>
+          <div className="pnl-badge">By {cfg.partyLabel.toLowerCase()}, aged from invoice date</div>
+        </div>
+        <div className="pnl-controls-row">
+          <span className="pnl-daterange-label">As of:</span>
+          <div style={{ width: 150 }}><Field type="date" value={asOf} onChange={setAsOf} /></div>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", margin: "0 0 14px" }}>
+        {[...bucketTotals, { b: "Total Outstanding", amount: round2(grand.outstanding), total: true }].map(({ b, amount, total }) => (
+          <div key={b} style={{ flex: "1 1 130px", border: "1px solid var(--border, #e2e8f0)", borderRadius: 8, padding: "8px 12px", background: total ? "var(--accent-soft, #eef2ff)" : "var(--panel, #f8fafc)" }}>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>{b}</div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>{fmtPlain(amount)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="pnl-card">
+        <div className="pnl-card-head">
+          <div className="pnl-card-title">{cfg.title}</div>
+          <div className="pnl-company">{data.company.name || "Your Company Name Inc."}</div>
+          <div className="pnl-currency">PHP (Philippine Peso)</div>
+          <div className="pnl-period">As of {formatDMY(asOfDate)}.</div>
+        </div>
+        {groups.length === 0 ? (
+          <div className="pnl-table"><div className="dim" style={{ padding: "14px 4px" }}>No outstanding {cfg.noun} as of {formatDMY(asOfDate)}.</div></div>
+        ) : (
+          <table className="pnl-table">
+            <tbody>
+              <tr className="pnl-section">
+                <td>{cfg.partyLabel} / Invoice No.</td><td className="num">Date</td><td className="num">Total</td>
+                <td className="num">Amount Paid</td><td className="num">Outstanding</td><td className="num">Age</td><td>Bucket</td>
+              </tr>
+              {groups.map((g) => (
+                <React.Fragment key={g.party}>
+                  <tr className="pnl-line"><td colSpan={7}><strong>{g.party}</strong></td></tr>
+                  {g.rows.map((r) => (
+                    <tr className="pnl-line" key={r.id}>
+                      <td style={{ paddingLeft: 20 }}>{r.invNo}</td>
+                      <td className="num">{r.date}</td>
+                      <td className="num">{fmtPlain(r.total)}</td>
+                      <td className="num">{r.paid ? fmtPlain(r.paid) : "—"}</td>
+                      <td className="num">{fmtPlain(r.outstanding)}</td>
+                      <td className="num">{r.ageDays}d</td>
+                      <td>{r.bucket}</td>
+                    </tr>
+                  ))}
+                  <tr className="pnl-total">
+                    <td>Subtotal — {g.party}</td><td></td>
+                    <td className="num">{fmtPlain(g.subtotal.total)}</td>
+                    <td className="num">{fmtPlain(g.subtotal.paid)}</td>
+                    <td className="num">{fmtPlain(g.subtotal.outstanding)}</td>
+                    <td colSpan={2}></td>
+                  </tr>
+                </React.Fragment>
+              ))}
+              <tr className="pnl-grand pnl-final">
+                <td>Grand Total</td><td></td>
+                <td className="num">{fmtPlain(grand.total)}</td>
+                <td className="num">{fmtPlain(grand.paid)}</td>
+                <td className="num">{fmtPlain(grand.outstanding)}</td>
+                <td colSpan={2}></td>
+              </tr>
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
