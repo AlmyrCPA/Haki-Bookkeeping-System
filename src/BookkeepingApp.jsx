@@ -8,7 +8,7 @@ import {
   Receipt, Wallet, ArrowDownToLine, ArrowUpFromLine, ScrollText, Scale,
   ClipboardList, TrendingUp, Landmark, Plus, Trash2, Menu, X, Info,
   ChevronDown, Save, RotateCcw, FileDown, FileUp, BarChart3, RefreshCw, Search, FileText, LogOut,
-  Settings, Check,
+  Settings, Check, Coins, Pencil, Undo2,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { doc, onSnapshot, setDoc } from "firebase/firestore";
@@ -43,6 +43,7 @@ function getAvailableYears(data) {
     collect(data.disbursements, "date");
     collect(data.receipts, "date");
     collect(data.generalJournal, "date");
+    collect(data.pettyCash, "date");
     collect(data.importation, "date");
   }
   const min = Math.min(...years), max = Math.max(...years);
@@ -225,6 +226,7 @@ const NAV = [
     { key: "disbursements", label: "Cash Disbursements", icon: ArrowUpFromLine },
     { key: "receipts", label: "Cash Receipts", icon: ArrowDownToLine },
     { key: "generaljournal", label: "General Journal", icon: ScrollText },
+    { key: "pettycash", label: "Petty Cash Journal", icon: Coins },
     { key: "fixedassets", label: "Fixed Asset Ledger", icon: Landmark },
     { key: "generalledger", label: "General Ledger", icon: BookOpenText },
   ]},
@@ -264,6 +266,7 @@ export function makeInitialData() {
     disbursements: [],
     receipts: [],
     generalJournal: [],
+    pettyCash: [], // unsupported cash purchases held as Drafts until posted to Cash Disbursements
     inventoryLog: [], // {id, year, month, beginning, ending}
     importation: [],
     fixedAssets: [],
@@ -317,6 +320,7 @@ function normalizeDatesInData(d) {
     disbursements: fixRows(d.disbursements),
     receipts: fixRows(d.receipts),
     generalJournal: (d.generalJournal || []).map((jv) => ({ ...jv, date: toMDY(jv.date) })),
+    pettyCash: fixRows(d.pettyCash),
   };
 }
 
@@ -572,6 +576,16 @@ const FIXEDASSET_COLS = [
   { header: "Depreciation Expense Account Code", field: "depExpenseAccount" },
   { header: "Status (Active/Fully Depreciated/Disposed)", field: "status" },
 ];
+const PETTY_COLS = [
+  { header: "Date (MM/DD/YYYY)", field: "date" },
+  { header: "Suppliers Name", field: "supplier" },
+  { header: "Payment Ref No.", field: "refNo" },
+  { header: "Description", field: "desc" },
+  { header: "Amount", field: "amount", type: "number" },
+  { header: "Bank Account", field: "bankAccount" },
+  { header: "Account Code", field: "coaCode" },
+  { header: "Remarks", field: "remarks" },
+];
 
 const JOURNAL_SHEETS = {
   sales: { title: "Sales Journal", cols: SALES_COLS, dataKey: "sales" },
@@ -579,6 +593,7 @@ const JOURNAL_SHEETS = {
   disbursements: { title: "Cash Disbursements", cols: DISB_COLS, dataKey: "disbursements" },
   receipts: { title: "Cash Receipts", cols: RECEIPT_COLS, dataKey: "receipts" },
   generaljournal: { title: "General Journal", cols: GJ_COLS, dataKey: "generalJournal" },
+  pettycash: { title: "Petty Cash Journal", cols: PETTY_COLS, dataKey: "pettyCash" },
   fixedassets: { title: "Fixed Asset Ledger", cols: FIXEDASSET_COLS, dataKey: "fixedAssets" },
   form2307: { title: "Creditable Withholding Taxes", cols: FORM2307_COLS, dataKey: "form2307" },
   employees: { title: "Alphalist of Employees", cols: EMPLOYEE_COLS, dataKey: "employees" },
@@ -637,6 +652,7 @@ const JOURNAL_TEMPLATE_DROPDOWNS = {
   disbursements: { vendor: { sheet: "Suppliers Master", col: "B" }, atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
   receipts: { atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
   generaljournal: { account: { sheet: "Chart of Accounts", col: "A" } },
+  pettycash: { bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
   fixedassets: { assetAccount: { sheet: "Chart of Accounts", col: "A" }, accumDepAccount: { sheet: "Chart of Accounts", col: "A" }, depExpenseAccount: { sheet: "Chart of Accounts", col: "A" }, status: { list: "Asset Status" } },
   form2307: { atc: { sheet: "ATC Reference", col: "A" } },
   employees: { isMWE: { list: "Yes / No" }, substitutedFiling: { list: "Yes / No" }, empStatus: { list: "Employment Status" }, prevEmpStatus: { list: "Employment Status" } },
@@ -742,6 +758,7 @@ function templateInstructionLines(journalKey) {
   if (journalKey === "sales") lines.push('4. Pick the customer from the "Customer Name" dropdown so TIN and Address auto-fill on import.');
   else if (journalKey === "purchases") lines.push('4. Pick the supplier and item from their dropdowns so details and account auto-fill on import.');
   else if (journalKey === "generaljournal") lines.push('4. Give every line of the same voucher the same "JV No." — matching JV numbers are grouped back into one voucher on import.', "5. Make sure each voucher's total Debit equals its total Credit.");
+  else if (journalKey === "pettycash") lines.push("4. Every imported line arrives as a Draft. Review it, then Post it from the Petty Cash Journal page to send it to Cash Disbursements.");
   lines.push(
     "",
     "VAT, EWT/CWT, and Net/Total amounts are calculated automatically by the app — leave those out.",
@@ -848,6 +865,15 @@ async function importJournalExcel(journalKey, file, data) {
       if (!r.bankAccount) r.bankAccount = "Cash on Hand";
       if (!r.coaCode) r.coaCode = "6170";
       return computeDisbRow(r);
+    });
+  } else if (journalKey === "pettycash") {
+    // Imported lines always arrive as Drafts: nothing here creates a disbursement or a pettyCashId link.
+    const names = pettySupplierNames(data);
+    newRows = rawRows.map((r) => {
+      r.supplier = snapSupplierName(names, r.supplier);
+      if (r.supplier && !names.some((n) => supplierKey(n) === supplierKey(r.supplier))) names.push(r.supplier);
+      if (!r.bankAccount) r.bankAccount = "Cash on Hand";
+      return r;
     });
   } else if (journalKey === "receipts") {
     newRows = rawRows.map((r) => {
@@ -987,6 +1013,7 @@ const PREVIEW_EXTRA_COLS = {
   form2307: [["atcRate", "Rate"], ["cwt", "CWT"]],
   employees: [["pGross", "Gross (Present)"], ["totalTaxableComp", "Total Taxable Comp."], ["taxDue", "Tax Due"]],
   generaljournal: [],
+  pettycash: [],
 };
 
 function previewColumns(journalKey) {
@@ -1102,6 +1129,14 @@ function buildExportTable(journalKey, rows, coaByCode) {
     const t = rows.reduce((a, r) => ({ amount: a.amount + num(r.amount), ewt: a.ewt + num(r.ewt), net: a.net + num(r.net) }), { amount: 0, ewt: 0, net: 0 });
     const totalsRow = ["", "", "", "", "", "", "TOTALS", fmtPlain(t.amount), fmtPlain(t.ewt), fmtPlain(t.net), "", ""];
     return { headers, body, totalsRow, numericCols: [7,8,9] };
+  }
+  if (journalKey === "pettycash") {
+    // `status` is derived by the page (Draft / Posted) and exported only, never imported.
+    const headers = ["Date","Suppliers Name","Payment Ref No.","Description","Amount","Bank Account","Chart of Accounts","Remarks","Status"];
+    const body = rows.map((r) => [r.date, r.supplier, r.refNo, r.desc, fmtPlain(r.amount), r.bankAccount, acctLabel(r.coaCode), r.remarks, r.status || "Draft"]);
+    const total = rows.reduce((a, r) => a + num(r.amount), 0);
+    const totalsRow = ["", "", "", "TOTALS", fmtPlain(total), "", "", "", ""];
+    return { headers, body, totalsRow, numericCols: [4] };
   }
   if (journalKey === "receipts") {
     const headers = ["Date","Received From","OR/Ref No.","Description","ATC","Rate","Amount","CWT","Net Amount","Bank Account","Account"];
@@ -2197,6 +2232,7 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
           {page === "disbursements" && <DisbursementsPage data={data} setData={setData} />}
           {page === "receipts" && <ReceiptsPage data={data} setData={setData} />}
           {page === "generaljournal" && <GeneralJournalPage data={data} setData={setData} />}
+          {page === "pettycash" && <PettyCashPage data={data} setData={setData} />}
           {page === "fixedassets" && <FixedAssetLedgerPage data={data} setData={setData} />}
           {page === "generalledger" && <GeneralLedgerDetailPage data={data} postings={postings} coaMap={coaMap} />}
           {page === "vat" && <VatSummaryPage data={data} postings={postings} />}
@@ -3757,7 +3793,9 @@ function DisbursementsPage({ data, setData }) {
                   <td><Field type="combo" options={suppOptions} value={r.vendor} onChange={(v) => onSupplier(r.id, v)}
                     onAddNew={(typed) => setQuickAddSupplier({ rowId: r.id, typedName: typed })} addNewLabel="supplier" /></td>
                   <td><Field value={r.cvNo} onChange={(v) => update(r.id, { cvNo: v })} placeholder="CV-001" /></td>
-                  <td><Field value={r.desc} onChange={(v) => update(r.id, { desc: v })} /></td>
+                  <td>{r.pettyCashId
+                    ? <div className="pc-desc-cell"><Field value={r.desc} onChange={(v) => update(r.id, { desc: v })} /><span className="td-tag system" title="Posted from the Petty Cash Journal">Petty cash</span></div>
+                    : <Field value={r.desc} onChange={(v) => update(r.id, { desc: v })} />}</td>
                   <td><Field type="combo" options={atcOptions} value={r.atc} onChange={(v) => onAtc(r.id, v)} /></td>
                   <td><ReadCell align="center">{r.atc ? `${round2(num(r.atcRate) * 100)}%` : "—"}</ReadCell></td>
                   <td><Field type="number" align="right" value={r.amount} onChange={(v) => update(r.id, { amount: v })} /></td>
@@ -3791,6 +3829,445 @@ function DisbursementsPage({ data, setData }) {
         <ConfirmModal title="Delete selected" danger confirmLabel="Delete"
           message={`Delete ${sel.selected.size} selected disbursement${sel.selected.size === 1 ? "" : "s"}? This cannot be undone.`}
           onCancel={() => setConfirmDeleteOpen(false)} onConfirm={confirmDeleteSelected} />
+      )}
+    </div>
+  );
+}
+
+/* ============================== PETTY CASH JOURNAL ============================== */
+// A holding journal for cash purchases with no invoice/OR. Lines are Drafts that never touch the
+// books; Posting creates a linked Cash Disbursements row (pettyCashId -> line.id), and only that
+// row reaches postings, the GL and reports. Status is derived from the link, never stored.
+
+// Supplier names compare ignoring case and extra spaces, so "aling rosa " and "Aling Rosa" match.
+function supplierKey(name) { return String(name ?? "").trim().replace(/\s+/g, " ").toLowerCase(); }
+
+// Suggestions for the Suppliers Name combo: Suppliers Master first, then names already used on
+// petty cash lines (the "remembered" names), de-duplicated by supplierKey. History is the source,
+// so nothing new is stored and nothing is ever written to Suppliers Master.
+function pettySupplierNames(data) {
+  const seen = new Set(); const out = [];
+  const add = (n) => { const k = supplierKey(n); if (k && !seen.has(k)) { seen.add(k); out.push(String(n).trim()); } };
+  (data.suppliers || []).forEach((s) => add(s.name));
+  (data.pettyCash || []).map((l) => String(l.supplier || "")).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })).forEach(add);
+  return out;
+}
+
+// Snaps typed text to an existing spelling when it matches ignoring case/spacing; otherwise keeps
+// the (tidied) text as a new free-text name.
+function snapSupplierName(names, typed) {
+  const k = supplierKey(typed);
+  if (!k) return "";
+  return names.find((n) => supplierKey(n) === k) || String(typed).trim().replace(/\s+/g, " ");
+}
+
+function masterTinFor(data, name) {
+  const k = supplierKey(name);
+  const s = k ? (data.suppliers || []).find((x) => supplierKey(x.name) === k) : null;
+  return s ? (s.tin || "") : "";
+}
+
+function pettyMissingFields(l) {
+  const missing = [];
+  if (!parseAppDate(l.date)) missing.push("Date");
+  if (!(num(l.amount) > 0)) missing.push("Amount");
+  if (!l.coaCode) missing.push("Chart of Accounts");
+  if (!l.bankAccount) missing.push("Bank Account");
+  return missing;
+}
+
+function postedPettyIds(d) {
+  return new Set((d.disbursements || []).map((r) => r.pettyCashId).filter(Boolean));
+}
+
+// No ATC and no EWT, ever, so these rows never feed QAP, 2307 or SAWT.
+function pettyCashToDisbursement(data, l) {
+  return computeDisbRow({
+    id: uid(), date: l.date, tin: masterTinFor(data, l.supplier), vendor: l.supplier, cvNo: l.refNo || "", desc: l.desc || "",
+    atc: "", atcRate: 0, amount: round2(num(l.amount)), bankAccount: l.bankAccount, coaCode: l.coaCode,
+    appliedToPurchaseId: "", pettyCashId: l.id,
+  });
+}
+
+const dateSortKey = (s) => { const d = parseAppDate(s); return d ? d.getTime() : Infinity; };
+
+// Inserts `incoming` into `rows` at date-sorted positions in one merge pass. Equal dates go AFTER
+// the existing rows, and the existing rows keep their (possibly deliberate) relative order.
+function insertByDate(rows, incoming) {
+  const queue = incoming.map((r, i) => ({ r, i, t: dateSortKey(r.date) }))
+    .sort((a, b) => (a.t === b.t ? a.i - b.i : (a.t < b.t ? -1 : 1)));
+  const out = []; let q = 0;
+  rows.forEach((e) => {
+    const et = dateSortKey(e.date);
+    while (q < queue.length && queue[q].t < et) out.push(queue[q++].r);
+    out.push(e);
+  });
+  while (q < queue.length) out.push(queue[q++].r);
+  return out;
+}
+
+// Inline date cell that commits on blur, so the date-sorted table doesn't reorder (and steal
+// focus) on every keystroke.
+function CommitOnBlurDate({ value, onCommit }) {
+  const [v, setV] = useState(value || "");
+  useEffect(() => { setV(value || ""); }, [value]);
+  return (
+    <div onBlur={(e) => { const next = e.target.value ? toMDY(e.target.value) : ""; if (next !== (value || "")) onCommit(next); }}>
+      <Field type="date" value={v} onChange={setV} />
+    </div>
+  );
+}
+
+function PettyCashEntryModal({ line, supplierNames, acctOptions, onCancel, onSubmit }) {
+  const [v, setV] = useState(() => line
+    ? { date: line.date || "", supplier: line.supplier || "", refNo: line.refNo || "", desc: line.desc || "", amount: line.amount ?? 0, bankAccount: line.bankAccount || "Cash on Hand", coaCode: line.coaCode || "", remarks: line.remarks || "" }
+    : { date: todayMDY(), supplier: "", refNo: "", desc: "", amount: 0, bankAccount: "Cash on Hand", coaCode: "", remarks: "" });
+  const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+  const handleSubmit = () => onSubmit({ ...v, date: v.date ? toMDY(v.date) : "", supplier: snapSupplierName(supplierNames, v.supplier), amount: round2(num(v.amount)) });
+  return (
+    <EntryModalShell title={line ? "Edit petty cash entry" : "Add petty cash entry"} submitLabel={line ? "Save changes" : "Add entry"} onCancel={onCancel} onSubmit={handleSubmit}>
+      <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
+      <LabeledField label="Suppliers Name"><Field type="combo" freeText options={supplierNames} value={v.supplier} onChange={(x) => set("supplier", snapSupplierName(supplierNames, x))} placeholder="Type or pick a name…" /></LabeledField>
+      <LabeledField label="Payment Ref No."><Field value={v.refNo} onChange={(x) => set("refNo", x)} /></LabeledField>
+      <LabeledField label="Amount"><Field type="number" align="right" value={v.amount} onChange={(x) => set("amount", x)} /></LabeledField>
+      <LabeledField label="Description" wide><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
+      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} /></LabeledField>
+      <LabeledField label="Chart of Accounts"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
+      <LabeledField label="Remarks" wide><Field value={v.remarks} onChange={(x) => set("remarks", x)} /></LabeledField>
+      <div className="qf-hint">Saved as a Draft. It reaches Cash Disbursements and the books only when you Post it.</div>
+    </EntryModalShell>
+  );
+}
+
+function PettyMassUpdateModal({ count, supplierNames, acctOptions, onCancel, onApply }) {
+  const [on, setOn] = useState({});
+  const [v, setV] = useState({ coaCode: "", bankAccount: "Cash on Hand", date: todayMDY(), supplier: "", remarks: "", desc: "" });
+  const [error, setError] = useState("");
+  const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+  const handleApply = () => {
+    const patch = {};
+    if (on.coaCode) { if (!v.coaCode) { setError("Pick a Chart of Accounts code."); return; } patch.coaCode = v.coaCode; }
+    if (on.bankAccount) { if (!v.bankAccount) { setError("Pick a Bank Account."); return; } patch.bankAccount = v.bankAccount; }
+    if (on.date) { if (!parseAppDate(v.date)) { setError("Enter a valid date (MM/DD/YYYY)."); return; } patch.date = toMDY(v.date); }
+    if (on.supplier) { const s = snapSupplierName(supplierNames, v.supplier); if (!s) { setError("Enter a supplier name."); return; } patch.supplier = s; }
+    if (on.remarks) patch.remarks = v.remarks;
+    if (on.desc) patch.desc = v.desc;
+    if (Object.keys(patch).length === 0) { setError("Choose at least one field to update."); return; }
+    onApply(patch);
+  };
+  const row = (key, label, input) => (
+    <div className="qf-row">
+      <label className="qf-check"><input type="checkbox" checked={!!on[key]} onChange={(e) => setOn((o) => ({ ...o, [key]: e.target.checked }))} /> Update {label}</label>
+      {input}
+    </div>
+  );
+  return (
+    <EntryModalShell title={`Mass update — ${count} line${count === 1 ? "" : "s"}`} submitLabel="Apply changes" onCancel={onCancel} onSubmit={handleApply}>
+      {error && <div className="qf-error">{error}</div>}
+      {row("coaCode", "Chart of Accounts", <Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} disabled={!on.coaCode} />)}
+      {row("bankAccount", "Bank Account", <Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} disabled={!on.bankAccount} />)}
+      {row("date", "Date", <Field type="date" value={v.date} onChange={(x) => set("date", x)} disabled={!on.date} />)}
+      {row("supplier", "Supplier", <Field type="combo" freeText options={supplierNames} value={v.supplier} onChange={(x) => set("supplier", snapSupplierName(supplierNames, x))} disabled={!on.supplier} />)}
+      {row("remarks", "Remarks", <Field value={v.remarks} onChange={(x) => set("remarks", x)} disabled={!on.remarks} />)}
+      {row("desc", "Description", <Field value={v.desc} onChange={(x) => set("desc", x)} disabled={!on.desc} />)}
+      <div className="qf-hint">Only checked fields change, and only on Draft lines. Posted lines among the {count} selected are skipped.</div>
+    </EntryModalShell>
+  );
+}
+
+// Fixes a misspelled supplier on every Draft line in one go. Posted lines are locked, so they keep
+// their name until unposted.
+function PettyRenameSupplierModal({ draftNames, supplierNames, onCancel, onApply }) {
+  const [from, setFrom] = useState(draftNames[0] || "");
+  const [to, setTo] = useState("");
+  const [error, setError] = useState("");
+  const handleApply = () => {
+    const fromKey = supplierKey(from);
+    const typed = String(to || "").trim().replace(/\s+/g, " ");
+    if (!fromKey) { setError("Pick the name to rename."); return; }
+    if (!typed) { setError("Enter the corrected name."); return; }
+    // Snap to an existing spelling, but never back onto the name being replaced (a case-only fix
+    // like "aling rosa" -> "Aling Rosa" must keep the new spelling).
+    const target = supplierNames.filter((n) => supplierKey(n) !== fromKey).find((n) => supplierKey(n) === supplierKey(typed)) || typed;
+    if (target === from) { setError("The new name is the same as the old one."); return; }
+    onApply(from, target);
+  };
+  return (
+    <EntryModalShell title="Rename supplier" submitLabel="Rename" onCancel={onCancel} onSubmit={handleApply}>
+      {error && <div className="qf-error">{error}</div>}
+      <LabeledField label="Current name" wide><Field type="select" options={draftNames} value={from} onChange={setFrom} /></LabeledField>
+      <LabeledField label="New name" wide><Field type="combo" freeText options={supplierNames} value={to} onChange={setTo} placeholder="Type or pick a name…" /></LabeledField>
+      <div className="qf-hint">Updates the Suppliers Name on every Draft line that uses the current name. Posted lines are not changed.</div>
+    </EntryModalShell>
+  );
+}
+
+function PettyCashPage({ data, setData }) {
+  const acctOptions = data.coa.filter((a) => a.type === "Expense" || a.type === "Asset" || a.type === "Liability").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
+  const coaByCode = useMemo(() => Object.fromEntries(data.coa.map((a) => [a.code, a])), [data.coa]);
+  const acctLabel = (code) => { const a = coaByCode[code]; return a ? `${code} · ${a.name}` : (code || "—"); };
+  const supplierNames = useMemo(() => pettySupplierNames(data), [data.suppliers, data.pettyCash]);
+  const snap = (typed) => snapSupplierName(supplierNames, typed);
+  // pettyCashId -> disbursement. A line is Posted iff it has an entry here.
+  const postedMap = useMemo(() => {
+    const m = new Map();
+    (data.disbursements || []).forEach((r) => { if (r.pettyCashId) m.set(r.pettyCashId, r); });
+    return m;
+  }, [data.disbursements]);
+  const importHook = useJournalImport("pettycash", data, ({ newRows }) => setData((d) => ({ ...d, pettyCash: [...(d.pettyCash || []), ...newRows] })));
+  const [filter, setFilter] = usePeriodFilter();
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("All");
+  const sel = useRowSelection();
+  const [entryModal, setEntryModal] = useState(null); // null | { line } (line undefined when adding)
+  const [confirmDelete, setConfirmDelete] = useState(null); // null | { ids, skipped, bulk }
+  const [massOpen, setMassOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const flash = (type, text) => { setMsg({ type, text }); setTimeout(() => setMsg(null), 6000); };
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+  // Every write re-checks the posted state inside the updater, so a locked line can't be changed
+  // even if the UI is a render behind.
+  const updateLines = (ids, patch) => {
+    const idSet = new Set(ids);
+    setData((d) => {
+      const posted = postedPettyIds(d);
+      return { ...d, pettyCash: (d.pettyCash || []).map((l) => (idSet.has(l.id) && !posted.has(l.id) ? { ...l, ...patch } : l)) };
+    });
+  };
+  const update = (id, patch) => updateLines([id], patch);
+
+  const planPost = (d, idSet) => {
+    const posted = postedPettyIds(d);
+    const toPost = []; let alreadyPosted = 0, incomplete = 0;
+    (d.pettyCash || []).forEach((l) => {
+      if (!idSet.has(l.id)) return;
+      if (posted.has(l.id)) alreadyPosted++;
+      else if (pettyMissingFields(l).length > 0) incomplete++;
+      else toPost.push(l);
+    });
+    return { toPost, alreadyPosted, incomplete };
+  };
+  // One setData and one merge pass for the whole batch, however many lines.
+  const postPettyCash = (ids) => {
+    const idSet = new Set(ids);
+    const result = planPost(data, idSet);
+    setData((d) => {
+      const { toPost } = planPost(d, idSet);
+      if (toPost.length === 0) return d;
+      return { ...d, disbursements: insertByDate(d.disbursements || [], toPost.map((l) => pettyCashToDisbursement(d, l))) };
+    });
+    return result;
+  };
+  const unpost = (id) => setData((d) => ({ ...d, disbursements: (d.disbursements || []).filter((r) => r.pettyCashId !== id) }));
+
+  const postSelected = () => {
+    const { toPost, alreadyPosted, incomplete } = postPettyCash([...sel.selected]);
+    const parts = [`Posted ${plural(toPost.length, "line")} to Cash Disbursements.`];
+    if (alreadyPosted) parts.push(`Skipped ${plural(alreadyPosted, "line")} already posted.`);
+    if (incomplete) parts.push(`Skipped ${plural(incomplete, "incomplete line")} (needs Date, Amount, Chart of Accounts and Bank Account).`);
+    flash(toPost.length ? "success" : "error", parts.join(" "));
+    sel.clear();
+  };
+
+  const requestDelete = (id) => {
+    if (postedMap.has(id)) { flash("error", "Unpost this line first."); return; }
+    setConfirmDelete({ ids: [id], skipped: 0, bulk: false });
+  };
+  const requestDeleteSelected = () => {
+    const ids = [...sel.selected];
+    const drafts = ids.filter((id) => !postedMap.has(id));
+    if (drafts.length === 0) { flash("error", `All ${plural(ids.length, "selected line")} are posted. Unpost them first.`); return; }
+    setConfirmDelete({ ids: drafts, skipped: ids.length - drafts.length, bulk: true });
+  };
+  const confirmDeleteLines = () => {
+    const { ids, skipped, bulk } = confirmDelete;
+    const idSet = new Set(ids);
+    setData((d) => {
+      const posted = postedPettyIds(d);
+      return { ...d, pettyCash: (d.pettyCash || []).filter((l) => !(idSet.has(l.id) && !posted.has(l.id))) };
+    });
+    if (bulk) {
+      flash("success", `Deleted ${plural(ids.length, "draft line")}.${skipped ? ` Skipped ${plural(skipped, "posted line")}.` : ""}`);
+      sel.clear();
+    } else if (sel.selected.has(ids[0])) sel.toggle(ids[0]);
+    setConfirmDelete(null);
+  };
+
+  const applyMassUpdate = (patch) => {
+    const ids = [...sel.selected];
+    const drafts = ids.filter((id) => !postedMap.has(id));
+    const skipped = ids.length - drafts.length;
+    updateLines(drafts, patch);
+    flash(drafts.length ? "success" : "error", `Updated ${plural(drafts.length, "draft line")}.${skipped ? ` Skipped ${plural(skipped, "posted line")}.` : ""}`);
+    sel.clear();
+    setMassOpen(false);
+  };
+
+  const draftSupplierNames = useMemo(() => {
+    const seen = new Set(); const out = [];
+    (data.pettyCash || []).forEach((l) => {
+      const k = supplierKey(l.supplier);
+      if (k && !postedMap.has(l.id) && !seen.has(k)) { seen.add(k); out.push(String(l.supplier).trim()); }
+    });
+    return out.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  }, [data.pettyCash, postedMap]);
+  const applyRename = (from, to) => {
+    const fromKey = supplierKey(from);
+    const count = (data.pettyCash || []).filter((l) => !postedMap.has(l.id) && supplierKey(l.supplier) === fromKey).length;
+    setData((d) => {
+      const posted = postedPettyIds(d);
+      return { ...d, pettyCash: (d.pettyCash || []).map((l) => (!posted.has(l.id) && supplierKey(l.supplier) === fromKey ? { ...l, supplier: to } : l)) };
+    });
+    flash("success", `Renamed "${from}" to "${to}" on ${plural(count, "draft line")}.`);
+    setRenameOpen(false);
+  };
+
+  const submitEntry = (values) => {
+    const editing = entryModal && entryModal.line;
+    if (editing) update(editing.id, values);
+    else setData((d) => ({ ...d, pettyCash: [...(d.pettyCash || []), { id: uid(), ...values }] }));
+    setEntryModal(null);
+  };
+
+  // Stored in entry order; the view sorts by date ascending (stable, undated lines last).
+  const sortedLines = useMemo(() => (data.pettyCash || []).map((l, i) => ({ l, i, t: dateSortKey(l.date) }))
+    .sort((a, b) => (a.t === b.t ? a.i - b.i : (a.t < b.t ? -1 : 1))).map((x) => x.l), [data.pettyCash]);
+  const filteredRows = useMemo(() => sortedLines.filter((l) =>
+    matchesPeriod(l.date, filter)
+    && matchesSearch(l, ["refNo", "supplier", "desc", "remarks"], search)
+    && (statusFilter === "All" || (statusFilter === "Posted") === postedMap.has(l.id))
+  ), [sortedLines, filter, search, statusFilter, postedMap]);
+  const totals = filteredRows.reduce((a, l) => {
+    const amt = num(l.amount);
+    return postedMap.has(l.id) ? { ...a, all: a.all + amt, posted: a.posted + amt } : { ...a, all: a.all + amt, draft: a.draft + amt };
+  }, { all: 0, draft: 0, posted: 0 });
+  const exportRows = useMemo(() => filteredRows.map((l) => ({ ...l, status: postedMap.has(l.id) ? "Posted" : "Draft" })), [filteredRows, postedMap]);
+  const exportHook = useJournalExport("pettycash", data, exportRows, coaByCode);
+  const pg = usePagination(filteredRows);
+  const emptyMsg = (data.pettyCash || []).length === 0 ? "No petty cash lines yet. Add your first one above." : "No petty cash lines match this filter.";
+
+  return (
+    <div>
+      <SectionHeader icon={Coins} title="Petty Cash Journal" subtitle="Cash purchases with no invoice or official receipt (wet-market buys, tips, small errands). Lines stay here as Drafts until you Post them."
+        right={<div className="header-actions"><ImportExportBar journalKey="pettycash" data={data} importHook={importHook} /><ExportBar exportHook={exportHook} /></div>} />
+      <div className="pc-hint"><Info size={13} /> Unsupported by invoices. Review before posting. Posted lines enter Cash Disbursements and the books.</div>
+      <ImportStatus status={importHook.status} />
+      <ExportStatus status={exportHook.status} />
+      <ExportStatus status={msg} />
+      {sel.selected.size > 0 && (
+        <SelectionBar count={sel.selected.size} onClear={sel.clear}>
+          <SelectAllMatching sel={sel} filteredRows={filteredRows} pageRows={pg.pageRows} />
+          <button className="io-btn accent" onClick={postSelected}><Check size={13} /> Post selected</button>
+          <button className="io-btn" onClick={() => setMassOpen(true)}><Pencil size={13} /> Mass update</button>
+          <button className="io-btn danger" onClick={requestDeleteSelected}><Trash2 size={13} /> Delete selected</button>
+        </SelectionBar>
+      )}
+      <div className="ledger-wrap">
+        <div className="table-toolbar">
+          <div className="toolbar-left">
+            <PeriodFilterBar filter={filter} setFilter={setFilter} years={getAvailableYears(data)} />
+            <select className="io-select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} title="Status">
+              <option value="All">All statuses</option>
+              <option value="Draft">Draft</option>
+              <option value="Posted">Posted</option>
+            </select>
+            <SearchBar value={search} onChange={setSearch} placeholder="Search ref. no., supplier, description, remarks…" />
+            {pg.total > 25 && <PageSizeSelect pg={pg} />}
+          </div>
+          <div className="header-actions">
+            {draftSupplierNames.length > 0 && <button className="io-btn" onClick={() => setRenameOpen(true)}><Pencil size={13} /> Rename supplier</button>}
+            <AddRowBtn onClick={() => setEntryModal({})}>Add petty cash entry</AddRowBtn>
+          </div>
+        </div>
+        <div className="table-scroll">
+          <table className="ledger-table">
+            <thead><tr>
+              <th style={{width:32}}><SelectAllCheckbox ids={pg.pageRows.map((l) => l.id)} selected={sel.selected} toggleAll={sel.toggleAll} /></th>
+              <th style={{minWidth:120}}>DATE</th><th style={{minWidth:190}}>SUPPLIERS NAME</th><th style={{minWidth:120}}>PAYMENT REF NO.</th>
+              <th style={{minWidth:200}}>DESCRIPTION</th><th style={{minWidth:110}} className="num-head">AMOUNT</th>
+              <th style={{minWidth:130}}>BANK ACCOUNT</th><th style={{minWidth:190}}>CHART OF ACCOUNTS</th><th style={{minWidth:180}}>REMARKS</th>
+              <th style={{minWidth:80}}>Status</th><th style={{minWidth:210}}>Actions</th>
+            </tr></thead>
+            <tbody>
+              {filteredRows.length === 0 && <tr><td colSpan={11} className="empty-row">{emptyMsg}</td></tr>}
+              {pg.pageRows.map((l) => {
+                const posted = postedMap.has(l.id);
+                const missing = posted ? [] : pettyMissingFields(l);
+                return (
+                  <tr key={l.id} className={sel.selected.has(l.id) ? "row-selected" : ""}>
+                    <td className="text-center"><RowCheckbox id={l.id} selected={sel.selected} toggle={sel.toggle} /></td>
+                    {posted ? (<>
+                      <td><ReadCell>{l.date || "—"}</ReadCell></td>
+                      <td><ReadCell>{l.supplier || "—"}</ReadCell></td>
+                      <td><ReadCell>{l.refNo || "—"}</ReadCell></td>
+                      <td><ReadCell>{l.desc || "—"}</ReadCell></td>
+                      <td><ReadCell align="right">{fmt(l.amount)}</ReadCell></td>
+                      <td><ReadCell>{l.bankAccount || "—"}</ReadCell></td>
+                      <td><ReadCell>{acctLabel(l.coaCode)}</ReadCell></td>
+                      <td><ReadCell>{l.remarks || "—"}</ReadCell></td>
+                    </>) : (<>
+                      <td><CommitOnBlurDate value={l.date} onCommit={(v) => update(l.id, { date: v })} /></td>
+                      <td><Field type="combo" freeText options={supplierNames} value={l.supplier} onChange={(v) => update(l.id, { supplier: snap(v) })} placeholder="Type or pick…" /></td>
+                      <td><Field value={l.refNo} onChange={(v) => update(l.id, { refNo: v })} /></td>
+                      <td><Field value={l.desc} onChange={(v) => update(l.id, { desc: v })} /></td>
+                      <td><Field type="number" align="right" value={l.amount} onChange={(v) => update(l.id, { amount: v })} /></td>
+                      <td><Field type="select" options={BANK_ACCOUNTS} value={l.bankAccount} onChange={(v) => update(l.id, { bankAccount: v })} /></td>
+                      <td><Field type="combo" options={acctOptions} value={l.coaCode} onChange={(v) => update(l.id, { coaCode: v })} /></td>
+                      <td><Field value={l.remarks} onChange={(v) => update(l.id, { remarks: v })} /></td>
+                    </>)}
+                    <td className="text-center"><span className={"td-tag " + (posted ? "reclass" : "system")}>{posted ? "Posted" : "Draft"}</span></td>
+                    <td>
+                      <div className="pc-actions">
+                        {posted ? (
+                          <button className="io-btn" onClick={() => unpost(l.id)} title="Remove the linked Cash Disbursements row and return this line to Draft"><Undo2 size={13} /> Unpost</button>
+                        ) : (
+                          <span title={missing.length ? `Fill in first: ${missing.join(", ")}` : "Post to Cash Disbursements"}>
+                            <button className="io-btn accent" disabled={missing.length > 0} onClick={() => postPettyCash([l.id])}><Check size={13} /> Post</button>
+                          </span>
+                        )}
+                        <span title={posted ? "Unpost this line first." : "Edit this line"}>
+                          <button className="io-btn" disabled={posted} onClick={() => setEntryModal({ line: l })}><Pencil size={13} /> Edit</button>
+                        </span>
+                        <span title={posted ? "Unpost this line first." : "Delete this line"}>
+                          <button className="io-btn danger" disabled={posted} onClick={() => requestDelete(l.id)}><Trash2 size={13} /></button>
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            {filteredRows.length > 0 && (
+              <tfoot><tr>
+                <td colSpan={5} className="totals-label">Totals ({plural(filteredRows.length, "line")})</td>
+                <td className="num">{fmt(totals.all)}</td>
+                <td colSpan={5} className="pc-split">Draft {fmt(totals.draft)} · Posted {fmt(totals.posted)}</td>
+              </tr></tfoot>
+            )}
+          </table>
+        </div>
+        <PaginationBar pg={pg} />
+      </div>
+      {entryModal && (
+        <PettyCashEntryModal line={entryModal.line} supplierNames={supplierNames} acctOptions={acctOptions}
+          onCancel={() => setEntryModal(null)} onSubmit={submitEntry} />
+      )}
+      {massOpen && (
+        <PettyMassUpdateModal count={sel.selected.size} supplierNames={supplierNames} acctOptions={acctOptions}
+          onCancel={() => setMassOpen(false)} onApply={applyMassUpdate} />
+      )}
+      {renameOpen && (
+        <PettyRenameSupplierModal draftNames={draftSupplierNames} supplierNames={supplierNames}
+          onCancel={() => setRenameOpen(false)} onApply={applyRename} />
+      )}
+      {confirmDelete && (
+        <ConfirmModal title={confirmDelete.bulk ? "Delete selected" : "Delete line"} danger confirmLabel="Delete"
+          message={confirmDelete.bulk
+            ? `Delete ${plural(confirmDelete.ids.length, "draft line")}?${confirmDelete.skipped ? ` ${plural(confirmDelete.skipped, "posted line")} will be skipped.` : ""} This cannot be undone.`
+            : "Delete this petty cash line? This cannot be undone."}
+          onCancel={() => setConfirmDelete(null)} onConfirm={confirmDeleteLines} />
       )}
     </div>
   );
@@ -7797,6 +8274,13 @@ function Style() {
       .td-tag { font-size: 10.5px; padding: 3px 8px; border-radius: 20px; font-weight: 600; }
       .td-tag.reclass { background: #E3F0FC; color: var(--green-deep); }
       .td-tag.system { background: var(--paper-deep); color: var(--ink-soft); }
+      .pc-hint { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-soft); background: var(--paper-deep); border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; margin-bottom: 12px; }
+      .pc-actions { display: flex; align-items: center; gap: 6px; }
+      .pc-actions .io-btn { padding: 5px 9px; }
+      .pc-actions .io-btn:disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
+      .pc-split { font-size: 12px; color: var(--ink-soft); font-weight: 500; }
+      .pc-desc-cell { display: flex; align-items: center; gap: 6px; }
+      .pc-desc-cell .td-tag { white-space: nowrap; }
 
       .combo-wrap { position: relative; width: 100%; }
       .combo-input { width: 100%; cursor: text; }
