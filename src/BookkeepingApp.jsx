@@ -6349,6 +6349,10 @@ function cwtTaxBase(data, amount) {
   return isVat ? round2(num(amount) / 1.12) : round2(num(amount));
 }
 
+// BIR DAT files and the QAP/SAWT reports carry the withholding rate as a percentage (1.00, 2.00,
+// 5.00), while the app stores it as a fraction (0.01, 0.02, 0.05). Convert once, where rows are built.
+const ratePct = (rate) => round2(num(rate) * 100);
+
 function buildFilingDetails(data, period) {
   const c = data.company;
   const isIndividual = c.taxpayerType === "Individual";
@@ -6356,7 +6360,10 @@ function buildFilingDetails(data, period) {
     ? [c.surname, [c.firstName, c.middleName].filter(Boolean).join(" ")].filter(Boolean).join(", ")
     : (c.name || c.registeredName || "");
   return {
-    companyTin: (c.tin || "").replace(/\D/g, ""),
+    // The BIR DAT formats carry the TIN as its 9-digit core; the branch code is a separate field.
+    // A TIN saved with its branch suffix (e.g. 009-116-134-000) must not leak the extra digits into
+    // the header or the file name, or the validation module rejects the file.
+    companyTin: (c.tin || "").replace(/\D/g, "").slice(0, 9),
     rdoCode: c.rdo || "",
     branchCode: c.branchCode || "0000",
     taxpayerType: c.taxpayerType, isIndividual,
@@ -6681,7 +6688,7 @@ async function downloadSlspiPdfReport(subMode, data, sourceRows, month, year) {
     colStyles = { 0:{cellWidth:60}, 1:{cellWidth:170}, 2:{cellWidth:85,halign:"right"}, 3:{cellWidth:80,halign:"right"}, 4:{cellWidth:100,halign:"right"}, 5:{cellWidth:60,halign:"right"}, 6:{cellWidth:75,halign:"right"}, 7:{cellWidth:75,halign:"right"} };
   }
 
-  const doc = new jsPDFCtor({ orientation: "landscape", unit: "pt", format: "letter" });
+  const doc = new jsPDFCtor({ orientation: "landscape", unit: "pt", format: "a4" });
   const left = 30; let y = 32;
   doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
   doc.text("Bureau of Internal Revenue", left, y); y += 12;
@@ -6705,15 +6712,15 @@ async function downloadSlspiPdfReport(subMode, data, sourceRows, month, year) {
   doc.text(d.tradeName, left + 95, y);
   doc.text(d.addr2, left + 520, y);
   y += 14;
-  doc.line(left, y - 4, 782, y - 4);
+  doc.line(left, y - 4, 812, y - 4);
   doc.text("Taxable Month", left, y + 8);
   doc.setFont("helvetica", "italic");
   doc.text(`${MONTHS[month - 1]}, ${year}`, left + 95, y + 8);
   y += 20;
-  doc.line(left, y, 782, y);
+  doc.line(left, y, 812, y);
   doc.line(left, boxTop - 14, left, y);
-  doc.line(782, boxTop - 14, 782, y);
-  doc.line(left, boxTop - 14, 782, boxTop - 14);
+  doc.line(812, boxTop - 14, 812, y);
+  doc.line(left, boxTop - 14, 812, boxTop - 14);
 
   const body = rows.map((r) => subMode === "SLP"
     ? [r.tin, r.nameAddr, fmtPlain(r.col1), fmtPlain(r.col2), fmtPlain(r.col3), fmtPlain(r.col4), r.stack, fmtPlain(r.col5), fmtPlain(r.col6)]
@@ -6797,6 +6804,101 @@ function downloadQapExcelReport(data, allRows, quarter, year) {
   XLSX.writeFile(wb, `${d.companyTin}_QAP_Report_Q${quarter}${year}.xlsx`);
 }
 
+// Shared A-list page for the QAP (1601-EQ Schedule 1) and SAWT PDF reports. Landscape so the wide
+// name columns and the amount / rate / tax columns never collide; long names wrap inside their column
+// instead of running into the next one, and the column headings repeat on every page.
+function renderAlphalistSchedulePdf(doc, { titleLines, agentLabel, agentName, tinText, rows }) {
+  const W = 842, H = 595, left = 40, right = 802;
+  const colX = { seq: left, tin: 72, corp: 168, ind: 420, atc: 580, amt: 678, rate: 730, ewt: right };
+  const corpW = 240, indW = 150;
+  let page = 1, y = 0, pageTotal = 0, grandTotal = 0;
+
+  const drawHeader = () => {
+    y = 40;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10);
+    doc.text(titleLines[0], W / 2, y, { align: "center" });
+    doc.text(`PAGE   ${page}`, right, y, { align: "right" }); y += 14;
+    doc.text(titleLines[1], W / 2, y, { align: "center" }); y += 14;
+    doc.setFont("helvetica", "normal");
+    doc.text(titleLines[2], W / 2, y, { align: "center" }); y += 26;
+
+    doc.setFontSize(9);
+    doc.text(agentLabel, left, y);
+    const nameX = left + doc.getTextWidth(agentLabel) + 10;
+    doc.setFont("helvetica", "bold");
+    doc.text(agentName, nameX, y);
+    doc.line(nameX - 2, y + 3, 610, y + 3);
+    doc.setFont("helvetica", "normal");
+    doc.text("TIN:", 630, y);
+    doc.setFont("helvetica", "bold");
+    doc.text(tinText, 654, y);
+    doc.line(652, y + 3, right, y + 3);
+    y += 26;
+
+    doc.setFontSize(8);
+    [["SEQ.", "TAXPAYER", "CORPORATION", "INDIVIDUAL", "ATC", "AMOUNT OF", "TAX", "AMOUNT OF TAX"],
+     ["NO.", "IDENTIFICATION", "(Registered Name)", "(LastName, FirstName  MiddleName)", "", "INCOME", "RATE", "WITHHELD"],
+     ["", "NUMBER (TIN)", "", "", "", "PAYMENT", "", ""]].forEach((line, li) => {
+      doc.setFont("helvetica", "bold");
+      doc.text(line[0], colX.seq, y + li * 10); doc.text(line[1], colX.tin, y + li * 10);
+      doc.text(line[2], colX.corp, y + li * 10); doc.text(line[3], colX.ind, y + li * 10);
+      doc.text(line[4], colX.atc, y + li * 10);
+      doc.text(line[5], colX.amt, y + li * 10, { align: "right" });
+      doc.text(line[6], colX.rate, y + li * 10, { align: "right" });
+      doc.text(line[7], colX.ewt, y + li * 10, { align: "right" });
+    });
+    y += 36;
+    doc.setFont("helvetica", "normal");
+    [["(1)", colX.seq], ["(2)", colX.tin], ["(3)", colX.corp], ["(4)", colX.ind], ["(5)", colX.atc]].forEach(([t, x]) => doc.text(t, x, y));
+    [["(6)", colX.amt], ["(7)", colX.rate], ["(8)", colX.ewt]].forEach(([t, x]) => doc.text(t, x, y, { align: "right" }));
+    y += 4;
+    doc.setLineWidth(0.4);
+    [[colX.seq, colX.seq + 22], [colX.tin, colX.tin + 80], [colX.corp, colX.corp + 130], [colX.ind, colX.ind + 130], [colX.atc, colX.atc + 28],
+     [colX.amt - 54, colX.amt], [colX.rate - 28, colX.rate], [colX.ewt - 54, colX.ewt]].forEach(([a, b]) => doc.line(a, y, b, y));
+    y += 14;
+  };
+
+  const pageTotalLine = () => {
+    doc.setFont("helvetica", "normal");
+    doc.text("---------------", colX.ewt, y, { align: "right" }); y += 12;
+    doc.setFont("helvetica", "bold");
+    doc.text("PAGE TOTAL", left, y);
+    doc.text(fmtPlain(pageTotal), colX.ewt, y, { align: "right" });
+  };
+
+  drawHeader();
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+  rows.forEach((r) => {
+    const corpLines = r.corp ? doc.splitTextToSize(r.corp, corpW) : [];
+    const indLines = r.ind ? doc.splitTextToSize(r.ind, indW) : [];
+    const n = Math.max(1, corpLines.length, indLines.length);
+    const rowH = n * 10 + 8;
+    if (y + rowH > H - 60) {
+      pageTotalLine();
+      doc.addPage(); page += 1; pageTotal = 0;
+      drawHeader();
+      doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+    }
+    doc.text(String(r.seq), colX.seq, y);
+    doc.text(r.tin, colX.tin, y);
+    if (corpLines.length) doc.text(corpLines, colX.corp, y);
+    if (indLines.length) doc.text(indLines, colX.ind, y);
+    doc.text(r.atc || "", colX.atc, y);
+    doc.text(fmtPlain(r.base), colX.amt, y, { align: "right" });
+    doc.text(Number(r.rate).toFixed(2), colX.rate, y, { align: "right" });
+    doc.text(fmtPlain(r.tax), colX.ewt, y, { align: "right" });
+    pageTotal += r.tax; grandTotal += r.tax;
+    y += rowH;
+  });
+  y += 6;
+  pageTotalLine();
+  if (page > 1) {
+    y += 16;
+    doc.text("GRAND TOTAL", left, y);
+    doc.text(fmtPlain(grandTotal), colX.ewt, y, { align: "right" });
+  }
+}
+
 async function downloadQapPdfReport(data, allRows, quarter, year) {
   const jsPDFCtor = await withTimeout(loadJsPDF(), 8000);
   const d = buildFilingDetails(data, { month: null, year, quarter, sawtFormType: null });
@@ -6805,72 +6907,20 @@ async function downloadQapPdfReport(data, allRows, quarter, year) {
   const byMonth = { 1: [], 2: [], 3: [] };
   allRows.forEach((r) => { byMonth[qapSlotIndex(r, d) + 1].push(r); });
 
-  const doc = new jsPDFCtor({ orientation: "portrait", unit: "pt", format: "letter" });
-  const left = 40; let y = 40;
-  doc.setFont("helvetica", "bold"); doc.setFontSize(10);
-  doc.text("BIR FORM 1601EQ - SCHEDULE 1", 306, y, { align: "center" });
-  doc.text("PAGE   1", 560, y, { align: "right" }); y += 14;
-  doc.text("ALPHABETICAL LIST OF PAYEES FROM WHOM TAXES WERE WITHHELD", 306, y, { align: "center" }); y += 14;
-  doc.setFont("helvetica", "normal");
-  doc.text(`FOR THE QUARTER ENDING ${MONTHS[quarterEndMonth - 1].toUpperCase()},   ${year}`, 306, y, { align: "center" }); y += 30;
-
-  doc.setFontSize(9);
-  doc.text("WITHHOLDING AGENT'S NAME :", left, y);
-  doc.setFont("helvetica", "bold");
-  doc.text(d.displayName, left + 170, y);
-  doc.line(left + 168, y + 3, 470, y + 3);
-  doc.setFont("helvetica", "normal");
-  doc.text("TIN:", 490, y);
-  doc.setFont("helvetica", "bold");
-  doc.text(`${reliefFormatTIN(d.companyTin)}-${branch3}`, 515, y);
-  doc.line(513, y + 3, 570, y + 3);
-  y += 30;
-
-  const colX = { seq: left, tin: left + 35, corp: left + 130, ind: left + 300, atc: left + 435, amt: left + 470, rate: left + 530, ewt: left + 560 };
-  doc.setFont("helvetica", "bold"); doc.setFontSize(8);
-  [["SEQ.","TAXPAYER","CORPORATION","INDIVIDUAL","ATC","AMOUNT OF","TAX","AMOUNT OF TAX"],
-   ["NO.","IDENTIFICATION","(Registered Name)","(LastName, FirstName  MiddleName)","","INCOME","RATE","WITHHELD"],
-   ["","NUMBER (TIN)","","","","PAYMENT","",""]].forEach((line, li) => {
-    doc.text(line[0], colX.seq, y + li * 10); doc.text(line[1], colX.tin, y + li * 10);
-    doc.text(line[2], colX.corp, y + li * 10); doc.text(line[3], colX.ind, y + li * 10);
-    doc.text(line[4], colX.atc, y + li * 10);
-    doc.text(line[5], colX.amt, y + li * 10, { align: "right" });
-    doc.text(line[6], colX.rate, y + li * 10, { align: "right" });
-    doc.text(line[7], colX.ewt, y + li * 10, { align: "right" });
+  const doc = new jsPDFCtor({ orientation: "landscape", unit: "pt", format: "a4" });
+  const pdfRows = [];
+  [1, 2, 3].forEach((m) => {
+    byMonth[m].forEach((r, i) => pdfRows.push({
+      seq: i + 1, tin: `${reliefFormatTIN(r.tin)}-${reliefPadBranch(r.branchCode)}`, corp: r.partyName || "",
+      ind: [r.surname, [r.firstName, r.middleName].filter(Boolean).join(" ")].filter(Boolean).join(", "),
+      atc: r.atc, base: r.taxBase, rate: r.rate, tax: r.ewt,
+    }));
   });
-  y += 34;
-  doc.setFont("helvetica", "normal");
-  doc.text("(1)", colX.seq, y); doc.text("(2)", colX.tin, y); doc.text("(3)", colX.corp, y);
-  doc.text("(4)", colX.ind, y); doc.text("(5)", colX.atc, y);
-  doc.text("(6)", colX.amt, y, { align: "right" }); doc.text("(7)", colX.rate, y, { align: "right" }); doc.text("(8)", colX.ewt, y, { align: "right" });
-  y += 6;
-  doc.text("----", colX.seq, y); doc.text("------------", colX.tin, y);
-  doc.text("------------------------------", colX.corp, y); doc.text("------------------------------", colX.ind, y);
-  doc.text("----", colX.atc, y); doc.text("-----------", colX.amt, y, { align: "right" });
-  doc.text("------", colX.rate, y, { align: "right" }); doc.text("-----------", colX.ewt, y, { align: "right" });
-  y += 16;
-
-  let grandTotal = 0;
-  [1,2,3].forEach((m) => {
-    byMonth[m].forEach((r, i) => {
-      grandTotal += r.ewt;
-      doc.text(String(i + 1), colX.seq, y);
-      doc.text(`${reliefFormatTIN(r.tin)}-${reliefPadBranch(r.branchCode)}`, colX.tin, y);
-      doc.text(r.partyName || "", colX.corp, y);
-      doc.text([r.surname, [r.firstName, r.middleName].filter(Boolean).join(" ")].filter(Boolean).join(", "), colX.ind, y);
-      doc.text(r.atc, colX.atc, y);
-      doc.text(fmtPlain(r.taxBase), colX.amt, y, { align: "right" });
-      doc.text(Number(r.rate).toFixed(2), colX.rate, y, { align: "right" });
-      doc.text(fmtPlain(r.ewt), colX.ewt, y, { align: "right" });
-      y += 22;
-      if (y > 740) { doc.addPage(); y = 40; }
-    });
+  renderAlphalistSchedulePdf(doc, {
+    titleLines: ["BIR FORM 1601EQ - SCHEDULE 1", "ALPHABETICAL LIST OF PAYEES FROM WHOM TAXES WERE WITHHELD",
+      `FOR THE QUARTER ENDING ${MONTHS[quarterEndMonth - 1].toUpperCase()},   ${year}`],
+    agentLabel: "WITHHOLDING AGENT'S NAME :", agentName: d.displayName, tinText: `${reliefFormatTIN(d.companyTin)}-${branch3}`, rows: pdfRows,
   });
-  y += 14;
-  doc.text("---------------", colX.ewt, y, { align: "right" }); y += 12;
-  doc.setFont("helvetica", "bold");
-  doc.text("PAGE TOTAL", left, y);
-  doc.text(fmtPlain(grandTotal), colX.ewt, y, { align: "right" });
   doc.save(`${d.companyTin}_QAP_Report_Q${quarter}${year}.pdf`);
 }
 
@@ -6916,72 +6966,16 @@ async function downloadSawtPdfReport(data, sourceRows, month, year, formType) {
   const d = buildFilingDetails(data, { month, year, quarter: null, sawtFormType: formType });
   const branch3 = reliefPadBranch(d.branchCode).slice(-3);
 
-  const doc = new jsPDFCtor({ orientation: "portrait", unit: "pt", format: "letter" });
-  const left = 40; let y = 40;
-  doc.setFont("helvetica", "bold"); doc.setFontSize(10);
-  doc.text(`BIR FORM ${formType}`, 306, y, { align: "center" });
-  doc.text("PAGE   1", 560, y, { align: "right" }); y += 14;
-  doc.text("SUMMARY ALPHALIST OF WITHHOLDING TAXES (SAWT)", 306, y, { align: "center" }); y += 14;
-  doc.setFont("helvetica", "normal");
-  doc.text(`FOR THE MONTH OF ${MONTHS[month - 1].toUpperCase()},   ${year}`, 306, y, { align: "center" }); y += 30;
-
-  doc.setFontSize(9);
-  doc.text("PAYEE'S NAME", left, y);
-  doc.setFont("helvetica", "bold");
-  doc.text(d.displayName, left + 90, y);
-  doc.line(left + 88, y + 3, 430, y + 3);
-  doc.setFont("helvetica", "normal");
-  doc.text("TIN :", 460, y);
-  doc.setFont("helvetica", "bold");
-  doc.text(`${reliefFormatTIN(d.companyTin)}-${branch3}`, 490, y);
-  doc.line(488, y + 3, 560, y + 3);
-  y += 30;
-
-  const colX = { seq: left, tin: left + 35, corp: left + 130, ind: left + 300, atc: left + 435, amt: left + 490, rate: left + 535, ewt: left + 570 };
-  doc.setFont("helvetica", "bold"); doc.setFontSize(8);
-  [["SEQ.","TAXPAYER","CORPORATION","INDIVIDUAL","ATC","AMOUNT OF","TAX","AMOUNT OF TAX"],
-   ["NO.","IDENTIFICATION","(Registered Name)","(LastName, FirstName  MiddleName)","","INCOME","RATE","WITHHELD"],
-   ["","NUMBER (TIN)","","","","PAYMENT","",""]].forEach((line, li) => {
-    doc.text(line[0], colX.seq, y + li * 10); doc.text(line[1], colX.tin, y + li * 10);
-    doc.text(line[2], colX.corp, y + li * 10); doc.text(line[3], colX.ind, y + li * 10);
-    doc.text(line[4], colX.atc, y + li * 10);
-    doc.text(line[5], colX.amt, y + li * 10, { align: "right" });
-    doc.text(line[6], colX.rate, y + li * 10, { align: "right" });
-    doc.text(line[7], colX.ewt, y + li * 10, { align: "right" });
+  const doc = new jsPDFCtor({ orientation: "landscape", unit: "pt", format: "a4" });
+  const pdfRows = sourceRows.map((r, i) => ({
+    seq: i + 1, tin: `${reliefFormatTIN(r.tin)}-${reliefPadBranch(r.branchCode)}`, corp: r.partyName || "",
+    ind: [r.surname, [r.firstName, r.middleName].filter(Boolean).join(" ")].filter(Boolean).join(", "),
+    atc: r.atc, base: r.taxBase, rate: r.rate, tax: r.cwt,
+  }));
+  renderAlphalistSchedulePdf(doc, {
+    titleLines: [`BIR FORM ${formType}`, "SUMMARY ALPHALIST OF WITHHOLDING TAXES (SAWT)", `FOR THE MONTH OF ${MONTHS[month - 1].toUpperCase()},   ${year}`],
+    agentLabel: "PAYEE'S NAME", agentName: d.displayName, tinText: `${reliefFormatTIN(d.companyTin)}-${branch3}`, rows: pdfRows,
   });
-  y += 34;
-  doc.setFont("helvetica", "normal");
-  doc.text("(1)", colX.seq, y); doc.text("(2)", colX.tin, y); doc.text("(3)", colX.corp, y);
-  doc.text("(4)", colX.ind, y); doc.text("(5)", colX.atc, y);
-  doc.text("(6)", colX.amt, y, { align: "right" }); doc.text("(7)", colX.rate, y, { align: "right" }); doc.text("(8)", colX.ewt, y, { align: "right" });
-  y += 6;
-  doc.text("----", colX.seq, y); doc.text("------------", colX.tin, y);
-  doc.text("------------------------------", colX.corp, y); doc.text("------------------------------", colX.ind, y);
-  doc.text("----", colX.atc, y); doc.text("-----------", colX.amt, y, { align: "right" });
-  doc.text("------", colX.rate, y, { align: "right" }); doc.text("-----------", colX.ewt, y, { align: "right" });
-  y += 16;
-
-  let grandTotal = 0;
-  sourceRows.forEach((r, i) => {
-    grandTotal += r.cwt;
-    doc.text(String(i + 1), colX.seq, y);
-    doc.text(`${reliefFormatTIN(r.tin)}-${reliefPadBranch(r.branchCode)}`, colX.tin, y);
-    if (r.partyName) doc.text(r.partyName, colX.corp, y);
-    doc.text(r.atc, colX.atc, y);
-    doc.text(Number(r.rate).toFixed(2), colX.rate, y, { align: "right" });
-    y += 12;
-    const indName = [r.surname, [r.firstName, r.middleName].filter(Boolean).join(" ")].filter(Boolean).join(", ");
-    if (indName) doc.text(indName, colX.ind, y);
-    doc.text(fmtPlain(r.taxBase), colX.amt, y, { align: "right" });
-    doc.text(fmtPlain(r.cwt), colX.ewt, y, { align: "right" });
-    y += 16;
-    if (y > 740) { doc.addPage(); y = 40; }
-  });
-  y += 10;
-  doc.text("---------------", colX.ewt, y, { align: "right" }); y += 12;
-  doc.setFont("helvetica", "bold");
-  doc.text("PAGE TOTAL", left, y);
-  doc.text(fmtPlain(grandTotal), colX.ewt, y, { align: "right" });
   doc.save(`${d.companyTin}_SAWT_Report_${pad2(month)}${year}.pdf`);
 }
 
@@ -8662,7 +8656,7 @@ function buildQapRowsFromEwtSource(data, quarter, year, source) {
       tin, branchCode: "0000",
       partyName: isIndiv ? "" : ((supp && (supp.name || supp.registeredName)) || e.party || ""),
       surname: isIndiv ? supp.surname : "", firstName: isIndiv ? supp.firstName : "", middleName: isIndiv ? supp.middleName : "",
-      atc: e.atc, rate: e.rate, taxBase: e.taxBase, ewt: e.ewt,
+      atc: e.atc, rate: ratePct(e.rate), taxBase: e.taxBase, ewt: e.ewt,
       monthInfo: { month: m, year: y, relative: false },
       sortKey: reliefPartySortKey(supp, e.party),
     });
@@ -8692,7 +8686,7 @@ function buildQapRowsFromReceipts(data, quarter, year) {
       tin, branchCode: "0000",
       partyName: isIndiv ? "" : ((cust && (cust.name || cust.registeredName)) || r.from || ""),
       surname: isIndiv ? cust.surname : "", firstName: isIndiv ? cust.firstName : "", middleName: isIndiv ? cust.middleName : "",
-      atc: r.atc, rate: num(r.atcRate), taxBase: round2(num(r.amount)), ewt: num(r.cwt),
+      atc: r.atc, rate: ratePct(r.atcRate), taxBase: round2(num(r.amount)), ewt: num(r.cwt),
       monthInfo: { month: m, year: y, relative: false },
       sortKey: reliefPartySortKey(cust, r.from),
     });
@@ -8719,7 +8713,7 @@ function buildSawtRowsFromForm2307(data, month, year) {
       tin, branchCode: "0000",
       partyName: isIndiv ? "" : (r.customerName || ""),
       surname: isIndiv ? (r.surname || "") : "", firstName: isIndiv ? (r.firstName || "") : "", middleName: isIndiv ? (r.middleName || "") : "",
-      atc: r.atc, rate: num(r.atcRate), taxBase: round2(num(r.incomePayment)), cwt: num(r.cwt),
+      atc: r.atc, rate: ratePct(r.atcRate), taxBase: round2(num(r.incomePayment)), cwt: num(r.cwt),
       sortKey: (r.customerName || r.surname || "").toLowerCase(),
     });
   });
@@ -8817,6 +8811,24 @@ function SLSPIPage({ data }) {
   );
 }
 
+// Preview consolidation: one line per payee per ATC, with the tax base and tax withheld split into
+// the three months of the quarter. (The .dat / PDF / Excel outputs are built separately.)
+function consolidateQapPreview(rows, quarter) {
+  const startIdx = QUARTERS[quarter - 1].months[0];
+  const map = new Map();
+  rows.forEach((r) => {
+    const name = r.partyName || [r.surname, r.firstName, r.middleName].filter(Boolean).join(" ");
+    const key = `${r.tin || "NOTIN:" + name.toLowerCase()}|${r.atc}`;
+    if (!map.has(key)) map.set(key, { key, name, tin: r.tin, atc: r.atc, rate: r.rate, base: [0, 0, 0], ewt: [0, 0, 0], count: 0 });
+    const g = map.get(key);
+    const slot = Math.min(2, Math.max(0, (r.monthInfo.month - 1) - startIdx));
+    g.base[slot] += r.taxBase; g.ewt[slot] += r.ewt; g.count += 1;
+    if (!g.rate) g.rate = r.rate;
+  });
+  return [...map.values()].map((g) => ({ ...g, base: g.base.map(round2), ewt: g.ewt.map(round2),
+    totalBase: round2(g.base[0] + g.base[1] + g.base[2]), totalEwt: round2(g.ewt[0] + g.ewt[1] + g.ewt[2]) }));
+}
+
 function QAPPage({ data }) {
   const [quarter, setQuarter] = useState(1);
   const [year, setYear] = useState(2026);
@@ -8828,6 +8840,9 @@ function QAPPage({ data }) {
   }, [data, quarter, year]);
   const filingDetails = useMemo(() => buildFilingDetails(data, { month: null, year, quarter, sawtFormType: null }), [data, year, quarter]);
   const groups = allRows.length ? buildQapGroups(filingDetails, allRows) : [];
+  const preview = useMemo(() => consolidateQapPreview(allRows, quarter), [allRows, quarter]);
+  const qMonths = QUARTERS[quarter - 1].months.map((m) => MONTHS[m]);
+  const sumCol = (fn) => round2(preview.reduce((t, g) => t + fn(g), 0));
   const [dlStatus, setDlStatus] = useState(null);
 
   const onDownload = async () => {
@@ -8858,22 +8873,34 @@ function QAPPage({ data }) {
           <div className="ledger-wrap">
             <div className="table-scroll">
               <table className="ledger-table report-table">
-                <thead><tr><th>Payee (alphabetical)</th><th>ATC</th><th>Month</th><th className="num-head">Tax Base</th><th className="num-head">EWT</th></tr></thead>
+                <thead>
+                  <tr>
+                    <th rowSpan={2}>Payee (alphabetical)</th><th rowSpan={2}>TIN</th><th rowSpan={2}>ATC</th><th rowSpan={2} className="num-head">Rate</th>
+                    {qMonths.map((m) => <th key={m} colSpan={2} className="num-head" style={{ textAlign: "center" }}>{m}</th>)}
+                    <th colSpan={2} className="num-head" style={{ textAlign: "center" }}>Quarter Total</th>
+                  </tr>
+                  <tr>
+                    {[...qMonths, "Total"].map((m) => <React.Fragment key={m}><th className="num-head">Tax Base</th><th className="num-head">EWT</th></React.Fragment>)}
+                  </tr>
+                </thead>
                 <tbody>
-                  {allRows.map((r, i) => (
-                    <tr key={i}>
-                      <td>{r.partyName || [r.surname, r.firstName, r.middleName].filter(Boolean).join(" ") || "—"}</td>
-                      <td>{r.atc}</td>
-                      <td>{MONTHS[r.monthInfo.month - 1]}</td>
-                      <td className="num">{fmt(r.taxBase)}</td>
-                      <td className="num">{fmt(r.ewt)}</td>
+                  {preview.map((g) => (
+                    <tr key={g.key}>
+                      <td>{g.name || "—"}</td>
+                      <td>{g.tin ? reliefFormatTIN(g.tin) : "— no TIN —"}</td>
+                      <td>{g.atc}</td>
+                      <td className="num">{fmtPlain(g.rate)}%</td>
+                      {[0, 1, 2].map((i) => <React.Fragment key={i}><td className="num">{g.base[i] ? fmt(g.base[i]) : "—"}</td><td className="num">{g.ewt[i] ? fmt(g.ewt[i]) : "—"}</td></React.Fragment>)}
+                      <td className="num" style={{ fontWeight: 600 }}>{fmt(g.totalBase)}</td>
+                      <td className="num" style={{ fontWeight: 600 }}>{fmt(g.totalEwt)}</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot><tr>
-                  <td colSpan={3} className="totals-label">Total — {allRows.length} transaction{allRows.length === 1 ? "" : "s"}</td>
-                  <td className="num">{fmt(round2(allRows.reduce((s, r) => s + r.taxBase, 0)))}</td>
-                  <td className="num">{fmt(round2(allRows.reduce((s, r) => s + r.ewt, 0)))}</td>
+                  <td colSpan={4} className="totals-label">Total — {preview.length} payee/ATC line{preview.length === 1 ? "" : "s"} ({allRows.length} transaction{allRows.length === 1 ? "" : "s"})</td>
+                  {[0, 1, 2].map((i) => <React.Fragment key={i}><td className="num">{fmt(sumCol((g) => g.base[i]))}</td><td className="num">{fmt(sumCol((g) => g.ewt[i]))}</td></React.Fragment>)}
+                  <td className="num">{fmt(sumCol((g) => g.totalBase))}</td>
+                  <td className="num">{fmt(sumCol((g) => g.totalEwt))}</td>
                 </tr></tfoot>
               </table>
             </div>
