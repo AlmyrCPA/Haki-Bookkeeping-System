@@ -8,7 +8,7 @@ import {
   Receipt, Wallet, ArrowDownToLine, ArrowUpFromLine, ScrollText, Scale,
   ClipboardList, TrendingUp, Landmark, Plus, Trash2, Menu, X, Info,
   ChevronDown, Save, RotateCcw, FileDown, FileUp, BarChart3, RefreshCw, Search, FileText, LogOut,
-  Settings, Check, Coins, Pencil, Undo2,
+  Settings, Check, Coins, Pencil, Undo2, Percent,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { doc, onSnapshot, setDoc } from "firebase/firestore";
@@ -82,7 +82,7 @@ const DEFAULT_COA = [
   ["1010","Cash in Bank","Asset","Current asset","Bank",""],
   ["1200","Accounts Receivable","Asset","Current asset","Account Receivable",""],
   ["1300","Inventories","Asset","Current asset","Current asset",""],
-  ["1400","Input VAT","Asset","Current asset","Current asset","Auto-summarized on VAT Summary"],
+  ["1400","Input VAT","Asset","Current asset","Current asset","Auto-summarized on VAT Schedule"],
   ["1500","Creditable Withholding Tax","Asset","Current asset","Current asset","From Cash Receipts"],
   ["1600","Security Deposit","Asset","Current asset","Current asset",""],
   ["1700","Transportation Vehicle","Asset","Non Current Asset","Fixed Assets",""],
@@ -92,7 +92,7 @@ const DEFAULT_COA = [
   ["2000","Accounts Payable","Liability","Current Liabilities","Accounts Payable",""],
   ["2020","VAT Payable","Liability","Current Liabilities","Current Liabilities",""],
   ["2100","Accrued Expenses","Liability","Current Liabilities","Current Liabilities",""],
-  ["2200","Output VAT","Liability","Current Liabilities","Current Liabilities","Auto-summarized on VAT Summary"],
+  ["2200","Output VAT","Liability","Current Liabilities","Current Liabilities","Auto-summarized on VAT Schedule"],
   ["2300","Withholding Taxes Expanded","Liability","Current Liabilities","Current Liabilities","From Cash Disbursements"],
   ["2400","SSS, PhilHealth and HDMF Payable","Liability","Current Liabilities","Current Liabilities",""],
   ["2500","Advances from Stockholders","Liability","Non-current Liabilities","Non-current Liabilities",""],
@@ -144,11 +144,21 @@ const DEFAULT_ITEMS = [
   ["CUSA","6080","Services"],
 ].map(([item,account,type]) => ({ id: item, item, account, type }));
 
+// EWT Schedule rate groups. Rate alone can't decide the group (Rentals and Professional are both
+// 5%), so each ATC carries an explicit ewtGroup; a blank or unknown group counts as "Other".
+const EWT_GROUPS = ["Rentals 5%", "Goods 1%", "Services 2%", "Professional 5%", "Professional 10%", "Professional 15%", "Other"];
+const DEFAULT_ATC_EWT_GROUPS = {
+  WC100: "Rentals 5%", WI100: "Rentals 5%",
+  WC158: "Goods 1%", WI158: "Goods 1%",
+  WC160: "Services 2%", WI160: "Services 2%", WC120: "Services 2%", WI120: "Services 2%",
+  WI010: "Professional 5%", WI011: "Professional 10%", WC010: "Professional 10%", WC011: "Professional 15%",
+};
+
 const DEFAULT_ATC = [
-  ["WI010",0.10,"Professional/talent fees – individuals (no sworn declaration, or gross income over ₱3M)"],
-  ["WI011",0.05,"Professional/talent fees – individuals (sworn declaration on file, ₱3M or below)"],
-  ["WC010",0.15,"Professional fees – corporations (gross income over ₱720,000)"],
-  ["WC011",0.10,"Professional fees – corporations (gross income ₱720,000 or below)"],
+  ["WI010",0.05,"Professional/talent fees – individuals (sworn declaration on file, gross income ₱3M or below)"],
+  ["WI011",0.10,"Professional/talent fees – individuals (no sworn declaration, or gross income over ₱3M)"],
+  ["WC010",0.10,"Professional fees – corporations (gross income ₱720,000 or below)"],
+  ["WC011",0.15,"Professional fees – corporations (gross income over ₱720,000)"],
   ["WI100",0.05,"Rental of real property – individual lessor"],
   ["WC100",0.05,"Rental of real property – corporate lessor"],
   ["WI120",0.02,"Contractors (engineering/building/specialty) – individual"],
@@ -157,13 +167,40 @@ const DEFAULT_ATC = [
   ["WC158",0.01,"Purchases of goods – Top Withholding Agent, corporate supplier"],
   ["WI160",0.02,"Purchases of services – Top Withholding Agent, individual supplier"],
   ["WC160",0.02,"Purchases of services – Top Withholding Agent, corporate supplier"],
-].map(([code,rate,desc], i) => ({ id: "atc"+i, code, rate, desc }));
+].map(([code,rate,desc], i) => ({ id: "atc"+i, code, rate, desc, ewtGroup: DEFAULT_ATC_EWT_GROUPS[code] || "" }));
+
+// Earlier builds shipped the four professional-fee ATCs with their rates (and descriptions) swapped.
+// Corrects ONLY rows still holding the old wrong rate for that code, so deliberate edits survive; the
+// description is replaced only when it is still the old default text. Also fills ewtGroup on default
+// codes where the field is missing (never overwrites a value, including a deliberate blank).
+// Idempotent — safe to run on every load / backup restore.
+const ATC_RATE_FIXES = {
+  WI010: { wrong: 0.10, right: 0.05, oldDesc: "Professional/talent fees – individuals (no sworn declaration, or gross income over ₱3M)" },
+  WI011: { wrong: 0.05, right: 0.10, oldDesc: "Professional/talent fees – individuals (sworn declaration on file, ₱3M or below)" },
+  WC010: { wrong: 0.15, right: 0.10, oldDesc: "Professional fees – corporations (gross income over ₱720,000)" },
+  WC011: { wrong: 0.10, right: 0.15, oldDesc: "Professional fees – corporations (gross income ₱720,000 or below)" },
+};
+const PROF_FEE_ATCS = Object.keys(ATC_RATE_FIXES);
+function fixAtcDefaults(atcRows) {
+  if (!Array.isArray(atcRows)) return atcRows;
+  return atcRows.map((r) => {
+    const code = String(r.code || "").trim().toUpperCase();
+    let next = r;
+    const fix = ATC_RATE_FIXES[code];
+    if (fix && Math.abs(num(r.rate) - fix.wrong) < 1e-9) {
+      const corrected = DEFAULT_ATC.find((a) => a.code === code);
+      next = { ...next, rate: fix.right, ...(r.desc === fix.oldDesc && corrected ? { desc: corrected.desc } : {}) };
+    }
+    if ((next.ewtGroup === undefined || next.ewtGroup === null) && DEFAULT_ATC_EWT_GROUPS[code]) next = { ...next, ewtGroup: DEFAULT_ATC_EWT_GROUPS[code] };
+    return next;
+  });
+}
 
 const VAT_TYPE_BOOKS = ["Purchase journal", "Sales journal"];
 const VAT_TYPE_SLSPI_FIELDS = ["Services", "Capital goods", "Other than capital goods", "Exempt", "Zero-Rated", "Exempt Sales", "Zero-Rated Sales", "Taxable Sales"];
 const DEFAULT_VAT_TYPES = [
-  ["12% VAT on Purchases (Services)", "Purchase journal", "Other than capital goods"],
-  ["12% VAT on Purchases (Goods)", "Purchase journal", "Services"],
+  ["12% VAT on Purchases (Services)", "Purchase journal", "Services"],
+  ["12% VAT on Purchases (Goods)", "Purchase journal", "Other than capital goods"],
   ["12% VAT on Purchases (Capital Goods)", "Purchase journal", "Capital goods"],
   ["0% VAT-exempt Purchases", "Purchase journal", "Exempt"],
   ["0% Zero-rated VAT purchases", "Purchase journal", "Zero-Rated"],
@@ -231,7 +268,8 @@ const NAV = [
     { key: "generalledger", label: "General Ledger", icon: BookOpenText },
   ]},
   { group: "Reports", items: [
-    { key: "vat", label: "VAT Summary", icon: Scale },
+    { key: "vat", label: "VAT Schedule", icon: Scale },
+    { key: "ewt", label: "EWT Schedule", icon: Percent },
     { key: "ledger", label: "Monthly Ledger", icon: ClipboardList },
     { key: "transactions", label: "Transaction Details", icon: Search },
     { key: "trial", label: "Trial Balance", icon: ClipboardList },
@@ -267,6 +305,9 @@ export function makeInitialData() {
     receipts: [],
     generalJournal: [],
     pettyCash: [], // unsupported cash purchases held as Drafts until posted to Cash Disbursements
+    vatSchedule: {}, // { [year]: { openingCarryOver, paid: [q1, q2, q3, q4] } } — the VAT Schedule's typed inputs
+    ewtSchedule: {}, // { [year]: { [monthIdx]: { paid, dateFiled, datePaid, bank, refNo } } } — the EWT Schedule's typed inputs
+    dismissedNotices: {}, // { [noticeKey]: true } — one-time notices the user has dismissed
     inventoryLog: [], // {id, year, month, beginning, ending}
     importation: [],
     fixedAssets: [],
@@ -295,7 +336,7 @@ function makeSampleAddOns() {
     ],
     disbursements: [
       computeDisbRow({ id: uid(), date: "01/07/2026", tin: "", vendor: "Meralco", cvNo: "CV-001", desc: "January electricity bill", atc: "", atcRate: 0, amount: 3500, bankAccount: "Cash in Bank", coaCode: "6090" }),
-      computeDisbRow({ id: uid(), date: "01/20/2026", tin: "259-225-658", vendor: "BAJARO JOHN PAULO D.", cvNo: "CV-002", desc: "Bookkeeping services, January", atc: "WI011", atcRate: 0.05, amount: 8000, bankAccount: "Cash in Bank", coaCode: "6160" }),
+      computeDisbRow({ id: uid(), date: "01/20/2026", tin: "259-225-658", vendor: "BAJARO JOHN PAULO D.", cvNo: "CV-002", desc: "Bookkeeping services, January", atc: "WI010", atcRate: 0.05, amount: 8000, bankAccount: "Cash in Bank", coaCode: "6160" }),
     ],
     receipts: [
       computeReceiptRow({ id: uid(), date: "01/08/2026", from: "Juan Dela Cruz Store", orNo: "OR-2201", desc: "Collection of December receivable", atc: "", atcRate: 0, amount: 5000, cwt: 0, bankAccount: "Cash on Hand", coaCode: "1200" }),
@@ -311,10 +352,28 @@ function makeSampleAddOns() {
 }
 
 // Normalizes any legacy (e.g. YYYY-MM-DD) date strings in loaded/imported data to MM/DD/YYYY.
+// Earlier builds shipped the two default purchase VAT types with their SLSPI Field swapped
+// ("(Services)" -> Other than capital goods, "(Goods)" -> Services), which mis-bucketed the SLP.
+// Corrects ONLY rows still holding the old wrong default value, so deliberate user edits are kept.
+// Idempotent — safe to run on every load / backup restore.
+const VAT_TYPE_SLSPI_FIXES = [
+  ["12% VAT on Purchases (Services)", "Other than capital goods", "Services"],
+  ["12% VAT on Purchases (Goods)", "Services", "Other than capital goods"],
+];
+function fixSwappedVatTypeDefaults(vatTypes) {
+  if (!Array.isArray(vatTypes)) return vatTypes;
+  return vatTypes.map((v) => {
+    const fix = VAT_TYPE_SLSPI_FIXES.find(([name, wrong]) => v.vatType === name && v.slspiField === wrong);
+    return fix ? { ...v, slspiField: fix[2] } : v;
+  });
+}
+
 function normalizeDatesInData(d) {
   const fixRows = (arr) => (arr || []).map((r) => ({ ...r, date: toMDY(r.date) }));
   return {
     ...d,
+    ...(Array.isArray(d.vatTypes) ? { vatTypes: fixSwappedVatTypeDefaults(d.vatTypes) } : {}),
+    ...(Array.isArray(d.atc) ? { atc: fixAtcDefaults(d.atc) } : {}),
     sales: fixRows(d.sales),
     purchases: fixRows(d.purchases),
     disbursements: fixRows(d.disbursements),
@@ -643,6 +702,7 @@ const TEMPLATE_FIXED_LISTS = {
   "VAT Books": VAT_TYPE_BOOKS,
   "SLSPI Field": VAT_TYPE_SLSPI_FIELDS,
   "Asset Status": ASSET_STATUSES,
+  "EWT Group": EWT_GROUPS,
 };
 
 // field -> dropdown source. { list: "<key in TEMPLATE_FIXED_LISTS>" } | { sheet, col }
@@ -663,7 +723,7 @@ const MASTER_TEMPLATE_DROPDOWNS = {
   "Customers Master": { type: { list: "Party Type" } },
   "Suppliers Master": { type: { list: "Party Type" }, itemCode: { sheet: "Item Record", col: "A" }, accountTitle: { sheet: "Chart of Accounts", col: "B" } },
   "Item Record": { account: { sheet: "Chart of Accounts", col: "A" }, type: { list: "Item Type" } },
-  "ATC Reference": {},
+  "ATC Reference": { ewtGroup: { list: "EWT Group" } },
   "VAT Type": { books: { list: "VAT Books" }, slspiField: { list: "SLSPI Field" } },
 };
 
@@ -2235,7 +2295,8 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
           {page === "pettycash" && <PettyCashPage data={data} setData={setData} />}
           {page === "fixedassets" && <FixedAssetLedgerPage data={data} setData={setData} />}
           {page === "generalledger" && <GeneralLedgerDetailPage data={data} postings={postings} coaMap={coaMap} />}
-          {page === "vat" && <VatSummaryPage data={data} postings={postings} />}
+          {page === "vat" && <VatSchedulePage data={data} setData={setData} postings={postings} />}
+          {page === "ewt" && <EwtSchedulePage data={data} setData={setData} postings={postings} />}
           {page === "ledger" && <GeneralLedgerPage data={data} postings={postings} coaMap={coaMap} />}
           {page === "transactions" && <TransactionDetailsPage data={data} setData={setData} postings={postings} coaMap={coaMap} />}
           {page === "trial" && <TrialBalancePage data={data} postings={postings} coaMap={coaMap} />}
@@ -2687,6 +2748,7 @@ function AtcReferencePage({ data, setData }) {
     { key: "code", label: "ATC Code", width: 100 },
     { key: "rate", label: "Rate", type: "percent", align: "center", width: 90 },
     { key: "desc", label: "Description", width: 420 },
+    { key: "ewtGroup", label: "EWT Group", type: "select", options: EWT_GROUPS, width: 160 },
   ];
   const onAtcChange = (id, key, v) => setData((d) => ({ ...d, atc: d.atc.map((r) => r.id === id ? { ...r, [key]: v } : r) }));
   const onAtcCreate = (row) => setData((d) => ({ ...d, atc: [...d.atc, row] }));
@@ -2695,7 +2757,8 @@ function AtcReferencePage({ data, setData }) {
 
   return (
     <div>
-      <SectionHeader icon={ListChecks} title="ATC Reference" subtitle="Alphanumeric Tax Code table — the BIR withholding-tax codes used across QAP and SAWT." />
+      <SectionHeader icon={ListChecks} title="ATC Reference" subtitle="Alphanumeric Tax Code table — the BIR withholding-tax codes used across QAP and SAWT. EWT Group sets the column each code falls in on the EWT Schedule (blank = Other)." />
+      <AtcRateReviewNotice data={data} setData={setData} />
       <MasterTable title="ATC Reference" columns={atcCols} rows={data.atc} data={data} onChange={onAtcChange} onCreate={onAtcCreate} onBulkAdd={onAtcBulkAdd} onDelete={onAtcDelete}
         addLabel="Add ATC code" />
     </div>
@@ -4705,40 +4768,824 @@ function GeneralLedgerDetailPage({ data, postings, coaMap }) {
   );
 }
 
-/* ============================== VAT SUMMARY ============================== */
+/* ============================== VAT SCHEDULE ============================== */
+// Mirrors the user's sample_vat_sched.xlsx: one row per month, a subtotal row per quarter, and a
+// TOTAL row, built from the journals' tax bases (not the GL). Column letters in comments are the
+// template's (B = MONTH ... W = VAT PAYABLE). The only typed inputs are the opening input carry-over
+// and the Amount Paid per quarter, stored in data.vatSchedule[year].
 
-function VatSummaryPage({ data, postings }) {
-  const [year, setYear] = useState(2026);
-  const rows = MONTHS.map((m, idx) => {
-    const start = new Date(year, idx, 1), end = monthEnd(year, idx);
+const VS_BASE_KEYS = ["vatable", "outputVat", "exempt", "zeroRated", "otherBase", "otherVat", "servBase", "servVat", "capBase", "capVat", "impBase", "impVat"];
+const VS_QUARTER_LABELS = ["1st Quarter", "2nd Quarter", "3rd Quarter", "4th Quarter"];
+// Display/export column order, template columns C..W.
+const VS_COLS = [
+  ["C", "vatable"], ["D", "outputVat"], ["E", "exempt"], ["F", "zeroRated"], ["G", "totalSales"], ["H", "totalOutputVat"],
+  ["I", "otherBase"], ["J", "otherVat"], ["K", "servBase"], ["L", "servVat"], ["M", "capBase"], ["N", "capVat"], ["O", "impBase"], ["P", "impVat"],
+  ["Q", "totalPurchases"], ["R", "totalInputVat"], ["S", "S"], ["T", "T"], ["U", "U"], ["V", "V"], ["W", "W"],
+];
+
+const vsEmpty = () => Object.fromEntries(VS_BASE_KEYS.map((k) => [k, 0]));
+function vsWithTotals(o) {
+  return {
+    ...o,
+    totalSales: o.vatable + o.exempt + o.zeroRated,
+    totalOutputVat: o.outputVat,
+    totalPurchases: o.otherBase + o.servBase + o.capBase + o.impBase,
+    totalInputVat: o.otherVat + o.servVat + o.capVat + o.impVat, // actual input VAT, not base × 12%
+  };
+}
+const vsAllocable = (o) => (o.totalSales ? (o.exempt / o.totalSales) * o.totalInputVat : 0);
+
+// One pass over the journals: year -> 12 monthly base/VAT buckets. Signed sums, so credit memos
+// reduce the month; rows with an unparseable date are skipped.
+function aggregateVatByYear(data) {
+  const byYear = new Map();
+  const bucket = (dateStr) => {
+    const d = parseAppDate(dateStr);
+    if (!d) return null;
+    const y = d.getFullYear();
+    if (!byYear.has(y)) byYear.set(y, Array.from({ length: 12 }, vsEmpty));
+    return byYear.get(y)[d.getMonth()];
+  };
+  (data.sales || []).forEach((r) => {
+    const m = bucket(r.date); if (!m) return;
+    m.vatable += num(r.vatable); m.outputVat += num(r.outputVat); m.exempt += num(r.exempt); m.zeroRated += num(r.zeroRated);
+  });
+  (data.purchases || []).forEach((r) => {
+    const field = purchaseSlspiField(data, r);
+    const key = field === "Other than capital goods" ? "other" : field === "Services" ? "serv" : field === "Capital goods" ? "cap" : null;
+    if (!key) return; // Exempt, Zero-Rated and Non-VAT purchases are not part of the schedule
+    const m = bucket(r.date); if (!m) return;
+    m[key + "Base"] += num(r.vatable) + num(r.nonvat); m[key + "Vat"] += num(r.inputVat);
+  });
+  (data.importation || []).forEach((r) => {
+    const m = bucket(r.date); if (!m) return;
+    m.impBase += num(r.dutiableValue); m.impVat += num(r.vatPaid);
+  });
+  return byYear;
+}
+
+// Settlement chain, exactly as the template's formulas:
+//   T = exempt / totalSales × totalInputVat (3rd month takes the quarter's balancing amount)
+//   U = totalOutputVat − totalInputVat − S + T,  W = U − V,  next S = −W
+// Months carry month to month; the first month of a quarter carries the previous QUARTER row's W.
+function computeVatSchedule(data, year, byYear, depth = 0) {
+  const cfg = (data.vatSchedule || {})[year] || {};
+  const hasOverride = cfg.openingCarryOver !== undefined && cfg.openingCarryOver !== null && cfg.openingCarryOver !== "";
+  let opening = 0;
+  if (hasOverride) opening = num(cfg.openingCarryOver);
+  else if (depth < 50 && byYear.has(year - 1)) opening = round2(-computeVatSchedule(data, year - 1, byYear, depth + 1).total.W);
+  const paid = [0, 1, 2, 3].map((q) => num((cfg.paid || [])[q]));
+  const monthly = (byYear.get(year) || Array.from({ length: 12 }, vsEmpty)).map(vsWithTotals);
+
+  let carry = opening;
+  const months = [], quarters = [];
+  for (let q = 0; q < 4; q++) {
+    const ms = monthly.slice(q * 3, q * 3 + 3);
+    const qBase = vsEmpty();
+    ms.forEach((m) => VS_BASE_KEYS.forEach((k) => { qBase[k] += m[k]; }));
+    const Q = vsWithTotals(qBase);
+    Q.T = vsAllocable(Q);
+    Q.S = carry;
+    const rows = ms.map((m) => ({ ...m }));
+    rows.forEach((m, k) => {
+      m.S = carry;
+      m.T = k < 2 ? vsAllocable(m) : Q.T - rows[0].T - rows[1].T;
+      m.U = m.totalOutputVat - m.totalInputVat - m.S + m.T;
+      m.V = 0;
+      m.W = m.U - m.V;
+      carry = -m.W;
+    });
+    Q.U = Q.totalOutputVat - Q.totalInputVat - Q.S + Q.T;
+    Q.V = paid[q];
+    Q.W = Q.U - Q.V;
+    carry = -Q.W;
+    months.push(...rows);
+    quarters.push(Q);
+  }
+  const tBase = vsEmpty();
+  quarters.forEach((Q) => VS_BASE_KEYS.forEach((k) => { tBase[k] += Q[k]; }));
+  const total = vsWithTotals(tBase);
+  total.S = opening;
+  total.T = quarters.reduce((a, Q) => a + Q.T, 0);
+  total.U = total.totalOutputVat - total.totalInputVat - total.S + total.T;
+  total.V = quarters.reduce((a, Q) => a + Q.V, 0);
+  total.W = total.U - total.V;
+  return { year, opening, openingAuto: !hasOverride, paid, months, quarters, total };
+}
+
+// Accounting display: zero as "-", negatives in parentheses.
+function fmtAcct(v) {
+  const r = round2(Number(v) || 0);
+  if (Math.abs(r) < 0.005) return "-";
+  return r < 0 ? `(${fmtPlain(-r)})` : fmtPlain(r);
+}
+
+// Display order: the opening row, then 3 months + quarter row per quarter, then TOTAL.
+function vatScheduleRows(s) {
+  const rows = [{ kind: "opening", label: "Opening carry-over" }];
+  for (let q = 0; q < 4; q++) {
+    for (let k = 0; k < 3; k++) rows.push({ kind: "month", label: MONTHS[q * 3 + k], v: s.months[q * 3 + k] });
+    rows.push({ kind: "quarter", q, label: VS_QUARTER_LABELS[q], v: s.quarters[q] });
+  }
+  rows.push({ kind: "total", label: "TOTAL", v: s.total });
+  return rows;
+}
+
+async function exportVatScheduleExcel(data, s) {
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet("VAT");
+  const NUMFMT = '_(* #,##0.00_);_(* \\(#,##0.00\\);_(* "-"??_);_(@_)';
+  const FONT = { name: "Calibri", size: 8 };
+  const thin = { style: "thin", color: { argb: "FF000000" } };
+  const BORDER = { top: thin, left: thin, bottom: thin, right: thin };
+  const YELLOW = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
+  const ORANGE = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC000" } };
+
+  // Column widths copied from the sample (A is the narrow spacer column).
+  [1.82, 8.54, 12.82, 11.27, 12.82, 13.45, 12.73, 13.54, 11.73, 11.73, 11.73, 11.73, 11.73, 9.82, 11.73, 11.73, 13, 13.18, 12, 11.18, 12.27, 10, 12.54]
+    .forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+
+  const put = (addr, value, opts = {}) => {
+    const c = ws.getCell(addr);
+    c.value = value;
+    c.font = { ...FONT, bold: !!opts.bold, ...(opts.size ? { size: opts.size } : {}) };
+    if (opts.num) c.numFmt = NUMFMT;
+    if (opts.border) c.border = BORDER;
+    if (opts.fill) c.fill = opts.fill;
+    if (opts.align) c.alignment = opts.align;
+    return c;
+  };
+  const f = (formula, result) => ({ formula, result: round2(result || 0) });
+
+  put("B1", data.company.name || "COMPANY NAME", { bold: true });
+  put("B2", `Vat Schedule ${s.year}`, { bold: true });
+
+  // Two-row header (rows 5/6), merged exactly as the template.
+  const HC = { horizontal: "center", vertical: "middle", wrapText: true };
+  const groupFill = (argb) => ({ type: "pattern", pattern: "solid", fgColor: { argb } });
+  const header5 = { B: "MONTH", C: "VATABLE SALES", D: "VATABLE SALES", E: "VAT EXEMPT SALES", F: "ZERO RATED SALES", G: "TOTAL SALES", H: "TOTAL OUTPUT VAT",
+    I: "OTHER THAN CAPITAL GOODS", J: "OTHER THAN CAPITAL GOODS", K: "DOMESTIC SERVICES", L: "DOMESTIC SERVICES", M: "CAPITAL GOODS", N: "CAPITAL GOODS",
+    O: "IMPORTATIONS", P: "IMPORTATIONS", Q: "TOTAL PURCHASES", R: "TOTAL INPUT VAT", S: "INPUT CARRY- OVER", T: "INPUT ALLOCABLE TO EXEMPT SALES",
+    U: "PAYABLE / (EXCESS)", V: "AMOUNT PAID", W: "VAT PAYABLE" };
+  const header6 = { ...header5, C: "TAX BASE", D: "OUTPUT VAT", E: "TAX BASE", F: "TAX BASE", I: "TAX BASE", J: "INPUT VAT", K: "TAX BASE", L: "INPUT VAT",
+    M: "TAX BASE", N: "INPUT VAT", O: "TAX BASE", P: "INPUT VAT" };
+  const fill5 = { C: "FFB4C6E7", D: "FFB4C6E7", I: "FFC9C9C9", J: "FFC9C9C9", K: "FFC9C9C9", L: "FFC9C9C9", M: "FFBFBFBF", N: "FFBFBFBF", O: "FFBFBFBF", P: "FFBFBFBF" };
+  Object.entries(header5).forEach(([col, text]) => put(`${col}5`, text, { bold: true, border: true, align: HC, size: col === "T" ? 7 : undefined, fill: fill5[col] ? groupFill(fill5[col]) : undefined }));
+  Object.entries(header6).forEach(([col, text]) => put(`${col}6`, text, { bold: true, border: true, align: HC, size: col === "T" ? 7 : undefined }));
+  ["B5:B6", "C5:D5", "G5:G6", "H5:H6", "I5:J5", "K5:L5", "M5:N5", "O5:P5", "Q5:Q6", "R5:R6", "S5:S6", "T5:T6", "U5:U6", "V5:V6", "W5:W6"].forEach((r) => ws.mergeCells(r));
+  ws.getRow(5).height = 12.75;
+  ws.getRow(6).height = 26.25;
+
+  // Row 7: the opening input carry-over (replaces the template's #REF!-prone prior-year row).
+  put("B7", "Opening carry-over", { border: true });
+  VS_COLS.forEach(([col]) => put(`${col}7`, col === "S" ? round2(s.opening) : null, { num: true, border: true }));
+
+  const BASE_COLS = ["C", "D", "E", "F", "I", "J", "K", "L", "M", "N", "O", "P"]; // values, never formulas
+  const valueKey = Object.fromEntries(VS_COLS);
+  const quarterRow = (q) => 8 + q * 4 + 3;
+  for (let q = 0; q < 4; q++) {
+    const qr = quarterRow(q);
+    for (let k = 0; k < 3; k++) {
+      const r = 8 + q * 4 + k;
+      const v = s.months[q * 3 + k];
+      put(`B${r}`, MONTHS[q * 3 + k], { border: true });
+      BASE_COLS.forEach((col) => put(`${col}${r}`, round2(v[valueKey[col]]), { num: true, border: true }));
+      put(`G${r}`, f(`C${r}+E${r}+F${r}`, v.totalSales), { num: true, border: true });
+      put(`H${r}`, f(`D${r}`, v.totalOutputVat), { num: true, border: true });
+      put(`Q${r}`, f(`I${r}+K${r}+O${r}+M${r}`, v.totalPurchases), { num: true, border: true });
+      put(`R${r}`, f(`J${r}+L${r}+N${r}+P${r}`, v.totalInputVat), { num: true, border: true });
+      const sFormula = q === 0 && k === 0 ? "S7" : (k === 0 ? `-W${quarterRow(q - 1)}` : `-W${r - 1}`);
+      put(`S${r}`, f(sFormula, v.S), { num: true, border: true });
+      put(`T${r}`, f(k < 2 ? `IF(G${r}=0,0,E${r}/G${r}*R${r})` : `T${qr}-SUM(T${r - 2}:T${r - 1})`, v.T), { num: true, border: true });
+      put(`U${r}`, f(`H${r}-R${r}-S${r}+T${r}`, v.U), { num: true, border: true });
+      put(`V${r}`, null, { num: true, border: true });
+      put(`W${r}`, f(`U${r}-V${r}`, v.W), { num: true, border: true });
+    }
+    const Q = s.quarters[q];
+    const r1 = qr - 3, r3 = qr - 1;
+    const qOpts = { num: true, border: true, bold: true, fill: YELLOW };
+    put(`B${qr}`, VS_QUARTER_LABELS[q], { border: true, bold: true, fill: YELLOW });
+    ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R"].forEach((col) => put(`${col}${qr}`, f(`SUM(${col}${r1}:${col}${r3})`, Q[valueKey[col]]), qOpts));
+    put(`S${qr}`, f(`S${r1}`, Q.S), qOpts);
+    put(`T${qr}`, f(`IF(G${qr}=0,0,E${qr}/G${qr}*R${qr})`, Q.T), qOpts);
+    put(`U${qr}`, f(`H${qr}-R${qr}-S${qr}+T${qr}`, Q.U), qOpts);
+    put(`V${qr}`, round2(Q.V), qOpts); // the amount actually paid with the 2550Q — a typed value
+    put(`W${qr}`, f(`U${qr}-V${qr}`, Q.W), qOpts);
+  }
+
+  // Row 25: TOTAL (row 24 left blank as in the template); row 26: the template's tie-out checks.
+  const T = s.total;
+  const tOpts = { num: true, border: true, bold: true, fill: ORANGE };
+  const qSum = (col) => [0, 1, 2, 3].map((q) => `${col}${quarterRow(q)}`).join("+");
+  put("B25", "TOTAL", { border: true, bold: true, fill: ORANGE });
+  BASE_COLS.forEach((col) => put(`${col}25`, f(qSum(col), T[valueKey[col]]), tOpts));
+  put("G25", f("C25+E25+F25", T.totalSales), tOpts);
+  put("H25", f("D25", T.totalOutputVat), tOpts);
+  put("Q25", f("I25+O25+K25+M25", T.totalPurchases), tOpts);
+  put("R25", f("J25+L25+N25+P25", T.totalInputVat), tOpts);
+  put("S25", f("S8", T.S), tOpts);
+  put("T25", f(qSum("T"), T.T), tOpts);
+  put("U25", f("H25-R25-S25+T25", T.U), tOpts);
+  put("V25", f(qSum("V"), T.V), tOpts);
+  put("W25", f("U25-V25", T.W), tOpts);
+  ["G", "H", "Q", "R"].forEach((col) => put(`${col}26`, f(`${qSum(col)}-${col}25`, 0), { num: true }));
+
+  ws.pageSetup = { orientation: "landscape", paperSize: 9, fitToPage: true, fitToWidth: 1, fitToHeight: 1, printArea: "B1:W26",
+    margins: { left: 0.25, right: 0.25, top: 0.75, bottom: 0.75, header: 0.3, footer: 0.3 } };
+  await saveExcelBuffer(wb, `VAT-Schedule-${s.year}-${todayFileStamp()}.xlsx`);
+}
+
+async function exportVatSchedulePDF(data, s) {
+  const jsPDFCtor = await withTimeout(loadJsPDF(), 8000);
+  const doc = new jsPDFCtor({ orientation: "landscape", unit: "mm", format: "a4" });
+  doc.setFontSize(11); doc.setFont(undefined, "bold");
+  doc.text(data.company.name || "Your Company Name Inc.", 8, 11);
+  doc.setFontSize(9); doc.setFont(undefined, "normal");
+  doc.text(`Vat Schedule ${s.year} — Printed ${todayMDY()}`, 8, 16);
+  const rs2 = (content) => ({ content, rowSpan: 2 });
+  const cs2 = (content) => ({ content, colSpan: 2 });
+  const head = [
+    [rs2("MONTH"), cs2("VATABLE SALES"), "VAT EXEMPT SALES", "ZERO RATED SALES", rs2("TOTAL SALES"), rs2("TOTAL OUTPUT VAT"),
+      cs2("OTHER THAN CAPITAL GOODS"), cs2("DOMESTIC SERVICES"), cs2("CAPITAL GOODS"), cs2("IMPORTATIONS"),
+      rs2("TOTAL PURCHASES"), rs2("TOTAL INPUT VAT"), rs2("INPUT CARRY-OVER"), rs2("INPUT ALLOCABLE TO EXEMPT SALES"), rs2("PAYABLE / (EXCESS)"), rs2("AMOUNT PAID"), rs2("VAT PAYABLE")],
+    ["TAX BASE", "OUTPUT VAT", "TAX BASE", "TAX BASE", "TAX BASE", "INPUT VAT", "TAX BASE", "INPUT VAT", "TAX BASE", "INPUT VAT", "TAX BASE", "INPUT VAT"],
+  ];
+  const rows = vatScheduleRows(s);
+  const body = rows.map((row) => row.kind === "opening"
+    ? [row.label, ...VS_COLS.map(([, key]) => (key === "S" ? fmtAcct(s.opening) : ""))]
+    : [row.label, ...VS_COLS.map(([, key]) => (row.kind === "month" && key === "V" ? "" : fmtAcct(row.v[key])))]);
+  doc.autoTable({
+    head, body, startY: 20, margin: { left: 6, right: 6 }, theme: "grid",
+    styles: { fontSize: 4.8, cellPadding: 0.7, overflow: "linebreak", halign: "right", lineWidth: 0.1 },
+    headStyles: { fillColor: [31, 95, 168], textColor: 255, fontStyle: "bold", halign: "center", valign: "middle", fontSize: 4.6 },
+    columnStyles: { 0: { halign: "left", cellWidth: 15 } },
+    didParseCell: (h) => {
+      if (h.section !== "body") return;
+      const kind = rows[h.row.index].kind;
+      if (kind === "quarter") { h.cell.styles.fillColor = [255, 243, 160]; h.cell.styles.fontStyle = "bold"; }
+      if (kind === "total") { h.cell.styles.fillColor = [255, 214, 150]; h.cell.styles.fontStyle = "bold"; }
+    },
+  });
+  doc.save(`VAT-Schedule-${s.year}-A4-${todayFileStamp()}.pdf`);
+}
+
+function VatSchedulePage({ data, setData, postings }) {
+  const [year, setYear] = useState(new Date().getFullYear());
+  const byYear = useMemo(() => aggregateVatByYear(data), [data.sales, data.purchases, data.importation, data.vatTypes]);
+  const sched = useMemo(() => computeVatSchedule(data, year, byYear), [data.vatSchedule, year, byYear]);
+  const rows = vatScheduleRows(sched);
+
+  const setCfg = (patch) => setData((d) => {
+    const all = d.vatSchedule || {};
+    return { ...d, vatSchedule: { ...all, [year]: { ...(all[year] || {}), ...patch } } };
+  });
+  const setPaid = (q, v) => {
+    const paid = [0, 1, 2, 3].map((i) => (((data.vatSchedule || {})[year] || {}).paid || [])[i] ?? "");
+    paid[q] = v;
+    setCfg({ paid });
+  };
+  const storedPaid = (q) => ((((data.vatSchedule || {})[year] || {}).paid || [])[q] ?? "");
+
+  // Check strip: schedule totals vs the GL's VAT accounts for the same year.
+  const gl = useMemo(() => {
+    const start = new Date(year, 0, 1), end = monthEnd(year, 11);
     let output = 0, input = 0;
     postings.forEach((p) => {
       if (!inRange(p.date, start, end)) return;
       if (p.code === "2200") output += p.credit - p.debit;
       if (p.code === "1400") input += p.debit - p.credit;
     });
-    return { month: m, output: round2(output), input: round2(input), net: round2(output - input) };
-  });
-  const totals = rows.reduce((a, r) => ({ output: a.output + r.output, input: a.input + r.input, net: a.net + r.net }), { output: 0, input: 0, net: 0 });
+    return { output: round2(output), input: round2(input) };
+  }, [postings, year]);
+  const outDiff = round2(sched.total.totalOutputVat - gl.output);
+  const inDiff = round2(sched.total.totalInputVat - gl.input);
+  const reconciled = Math.abs(outDiff) < 1 && Math.abs(inDiff) < 1;
+
+  const reportExport = useReportExport(() => exportVatSchedulePDF(data, sched), () => exportVatScheduleExcel(data, sched));
+  const exportHook = { exportPDF: reportExport.exportPDF, exportExcel: reportExport.exportExcel };
+
+  const cell = (row, key) => {
+    if (row.kind === "opening") {
+      if (key !== "S") return <td key={key}></td>;
+      return (
+        <td key={key} className="vs-input">
+          <Field type="number" align="right" value={sched.opening}
+            onChange={(v) => setCfg({ openingCarryOver: v })} />
+          <div className="vs-input-note">
+            {sched.openingAuto
+              ? <span title={`Closing balance of the ${year - 1} schedule, or 0 when ${year - 1} has no VAT data`}>auto</span>
+              : <button className="vs-link" onClick={() => setCfg({ openingCarryOver: null })}>reset to auto</button>}
+          </div>
+        </td>
+      );
+    }
+    if (key === "V" && row.kind === "quarter") {
+      return <td key={key} className="vs-input"><Field type="number" align="right" value={storedPaid(row.q)} onChange={(v) => setPaid(row.q, v)} /></td>;
+    }
+    if (key === "V" && row.kind === "month") return <td key={key} className="num"></td>;
+    return <td key={key} className="num">{fmtAcct(row.v[key])}</td>;
+  };
 
   return (
     <div>
-      <SectionHeader icon={Scale} title="VAT Summary" subtitle="Monthly Output VAT vs Input VAT — mirrors BIR Form 2550M/2550Q logic. Verify against actual invoices before filing."
-        right={<select className="year-select" value={year} onChange={(e) => setYear(Number(e.target.value))}>{getAvailableYears(data).map((y) => <option key={y} value={y}>{y}</option>)}</select>} />
+      <SectionHeader icon={Scale} title="VAT Schedule" subtitle="Monthly output and input VAT by tax base, quarter subtotals and settlement, built from the Sales Journal, Purchase Journal (by VAT Type SLSPI Field) and Importation Ledger."
+        right={<div className="header-actions">
+          <ExportBar exportHook={exportHook} />
+          <select className="year-select" value={year} onChange={(e) => setYear(Number(e.target.value))}>{getAvailableYears(data).map((y) => <option key={y} value={y}>{y}</option>)}</select>
+        </div>} />
+      <ExportStatus status={reportExport.status} />
+      <div className="pc-hint"><Info size={13} /> Type the opening input carry-over and the Amount Paid with each 2550Q. Everything else is computed. Excess input VAT shows in parentheses and carries forward.</div>
       <div className="ledger-wrap">
-        <div className="table-scroll">
-          <table className="ledger-table report-table">
-            <thead><tr><th>Month</th><th className="num-head">Output VAT</th><th className="num-head">Input VAT</th><th className="num-head">Net VAT Payable</th></tr></thead>
+        <div className="table-scroll vs-scroll">
+          <table className="ledger-table report-table vs-table">
+            <thead>
+              <tr>
+                <th rowSpan={2} className="vs-sticky">Month</th>
+                <th colSpan={2} className="vs-grp vs-grp-sales">Vatable Sales</th><th className="vs-grp">VAT Exempt Sales</th><th className="vs-grp">Zero Rated Sales</th>
+                <th rowSpan={2} className="num-head">Total Sales</th><th rowSpan={2} className="num-head">Total Output VAT</th>
+                <th colSpan={2} className="vs-grp vs-grp-purch">Other Than Capital Goods</th><th colSpan={2} className="vs-grp vs-grp-purch">Domestic Services</th>
+                <th colSpan={2} className="vs-grp vs-grp-cap">Capital Goods</th><th colSpan={2} className="vs-grp vs-grp-cap">Importations</th>
+                <th rowSpan={2} className="num-head">Total Purchases</th><th rowSpan={2} className="num-head">Total Input VAT</th>
+                <th rowSpan={2} className="num-head">Input Carry-Over</th><th rowSpan={2} className="num-head vs-wrap">Input Allocable to Exempt Sales</th>
+                <th rowSpan={2} className="num-head">Payable / (Excess)</th><th rowSpan={2} className="num-head">Amount Paid</th><th rowSpan={2} className="num-head">VAT Payable</th>
+              </tr>
+              <tr>
+                {["Tax Base", "Output VAT", "Tax Base", "Tax Base", "Tax Base", "Input VAT", "Tax Base", "Input VAT", "Tax Base", "Input VAT", "Tax Base", "Input VAT"]
+                  .map((h, i) => <th key={i} className="num-head">{h}</th>)}
+              </tr>
+            </thead>
             <tbody>
-              {rows.map((r) => (
-                <tr key={r.month}><td>{r.month}</td><td className="num">{fmt(r.output)}</td><td className="num">{fmt(r.input)}</td>
-                  <td className={"num" + (r.net < 0 ? " neg" : "")}>{fmt(r.net)}</td></tr>
+              {rows.map((row) => (
+                <tr key={row.label} className={row.kind === "quarter" ? "vs-quarter" : row.kind === "total" ? "vs-total" : row.kind === "opening" ? "vs-opening" : ""}>
+                  <td className="vs-sticky">{row.label}{row.kind === "opening" ? ` (${year - 1})` : ""}</td>
+                  {VS_COLS.map(([, key]) => cell(row, key))}
+                </tr>
               ))}
             </tbody>
-            <tfoot><tr><td className="totals-label">Total — {year}</td><td className="num">{fmt(totals.output)}</td><td className="num">{fmt(totals.input)}</td>
-              <td className={"num" + (totals.net < 0 ? " neg" : "")}>{fmt(totals.net)}</td></tr></tfoot>
           </table>
         </div>
+      </div>
+
+      <div className={"vs-check " + (reconciled ? "ok" : "warn")}>
+        <div className="vs-check-head">{reconciled ? <><Check size={14} /> Reconciled with the General Ledger</> : <><Info size={14} /> Doesn't tie to the General Ledger</>}</div>
+        <div className="vs-check-grid">
+          <span></span><span className="vs-check-col">Schedule</span><span className="vs-check-col">General Ledger</span><span className="vs-check-col">Difference</span>
+          <span>Total Output VAT vs 2200 (credit − debit)</span><span className="num">{fmtPlain(sched.total.totalOutputVat)}</span><span className="num">{fmtPlain(gl.output)}</span><span className="num">{fmtParen(outDiff)}</span>
+          <span>Total Input VAT vs 1400 (debit − credit)</span><span className="num">{fmtPlain(sched.total.totalInputVat)}</span><span className="num">{fmtPlain(gl.input)}</span><span className="num">{fmtParen(inDiff)}</span>
+        </div>
+        {!reconciled && (
+          <div className="vs-check-causes">
+            Likely causes: manual General Journal entries to 2200 / 1400; input VAT on Exempt, Zero-Rated or Non-VAT purchases, or on a VAT Type with a blank SLSPI Field (they post to 1400 but aren't in the schedule); importation VAT, which the Importation Ledger doesn't post to the GL; or entries dated outside {year}.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== EWT SCHEDULE ============================== */
+// Mirrors the user's EWT_sched_SAMPLE.xlsx: tax base and EWT per rate group by month, quarter
+// subtotals, a TOTAL row, the settlement block (paid / payable / filing details), and a Summary per
+// ATC. Figures come from ewtSourceRows (the QAP's own source rows). Only the settlement block is typed,
+// stored in data.ewtSchedule[year][monthIdx]. A monitoring tool: it doesn't generate 0619-E / 1601-EQ.
+
+const EWT_QUARTER_LABELS = ["1st Qtr", "2nd Qtr", "3rd Qtr", "4th Qtr"];
+const EWT_SUMMARY_FIXED_ATCS = ["WC100", "WC158", "WC160", "WC120", "WI158", "WI160", "WI120", "WI010", "WI011", "WC010", "WC011"];
+const ewtGroupHeader = (g) => (g === "Other" ? "Other / unmapped ATC" : g.replace(/ (\d+%)$/, " - $1"));
+const atcKey = (code) => String(code || "").trim().toUpperCase();
+
+function ewtGroupOf(atcByCode, code) {
+  const g = (atcByCode.get(atcKey(code)) || {}).ewtGroup;
+  return EWT_GROUPS.includes(g) ? g : "Other";
+}
+
+function computeEwtSchedule(data, year) {
+  const atcByCode = new Map((data.atc || []).map((a) => [atcKey(a.code), a]));
+  const blank = () => ({ base: Object.fromEntries(EWT_GROUPS.map((g) => [g, 0])), ewt: Object.fromEntries(EWT_GROUPS.map((g) => [g, 0])) });
+  const monthly = Array.from({ length: 12 }, blank);
+  const perAtc = new Map();
+  ewtSourceRows(data).forEach((e) => {
+    const d = parseAppDate(e.date);
+    if (!d || d.getFullYear() !== year) return;
+    const g = ewtGroupOf(atcByCode, e.atc);
+    const m = monthly[d.getMonth()];
+    m.base[g] += e.taxBase; m.ewt[g] += e.ewt;
+    const k = atcKey(e.atc);
+    const a = perAtc.get(k) || { taxBase: 0, ewt: 0 };
+    a.taxBase += e.taxBase; a.ewt += e.ewt;
+    perAtc.set(k, a);
+  });
+  const cfg = (data.ewtSchedule || {})[year] || {};
+  const finish = (o, paid) => {
+    const totalBase = EWT_GROUPS.reduce((s, g) => s + o.base[g], 0);
+    const totalEwt = EWT_GROUPS.reduce((s, g) => s + o.ewt[g], 0);
+    return { ...o, totalBase, totalEwt, paid, payable: totalEwt - paid };
+  };
+  const months = monthly.map((m, i) => ({ ...finish(m, num((cfg[i] || {}).paid)), idx: i, input: cfg[i] || {} }));
+  const sumOf = (rows) => {
+    const o = blank();
+    rows.forEach((r) => EWT_GROUPS.forEach((g) => { o.base[g] += r.base[g]; o.ewt[g] += r.ewt[g]; }));
+    return finish(o, rows.reduce((s, r) => s + r.paid, 0));
+  };
+  const quarters = [0, 1, 2, 3].map((q) => ({ ...sumOf(months.slice(q * 3, q * 3 + 3)), q }));
+  const total = sumOf(quarters);
+  // "Other" only shows when it carries an amount, so an ATC without a group is never silently dropped.
+  const showOther = months.some((m) => Math.abs(m.base.Other) >= 0.005 || Math.abs(m.ewt.Other) >= 0.005);
+  const groups = EWT_GROUPS.filter((g) => g !== "Other" || showOther);
+  const codes = [...new Set([...EWT_SUMMARY_FIXED_ATCS, ...perAtc.keys()])].sort();
+  const summary = codes.map((code) => ({ code, desc: (atcByCode.get(code) || {}).desc || "", group: ewtGroupOf(atcByCode, code), ...(perAtc.get(code) || { taxBase: 0, ewt: 0 }) }));
+  const summaryTotal = summary.reduce((a, r) => ({ taxBase: a.taxBase + r.taxBase, ewt: a.ewt + r.ewt }), { taxBase: 0, ewt: 0 });
+  return { year, groups, months, quarters, total, summary, summaryTotal };
+}
+
+// Display order: 3 months + quarter row per quarter, then TOTAL.
+function ewtScheduleRows(s) {
+  const rows = [];
+  for (let q = 0; q < 4; q++) {
+    for (let k = 0; k < 3; k++) rows.push({ kind: "month", label: MONTHS[q * 3 + k], v: s.months[q * 3 + k] });
+    rows.push({ kind: "quarter", label: EWT_QUARTER_LABELS[q], v: s.quarters[q] });
+  }
+  rows.push({ kind: "total", label: "TOTAL", v: s.total });
+  return rows;
+}
+
+// Professional-fee transactions recorded while the ATC defaults were swapped keep the old rate/EWT on
+// their own row; this lists rows whose rate differs from the (corrected) ATC Reference rate.
+function profFeeRateMismatches(data) {
+  const refRate = new Map((data.atc || []).map((a) => [atcKey(a.code), num(a.rate)]));
+  const out = [];
+  const check = (journal, r, party, ref, withheld) => {
+    const code = atcKey(r.atc);
+    if (!PROF_FEE_ATCS.includes(code) || !refRate.has(code)) return;
+    if (Math.abs(num(r.atcRate) - refRate.get(code)) < 1e-9) return;
+    out.push({ id: `${journal}:${r.id}`, journal, date: r.date, party, ref, atc: code, rowRate: num(r.atcRate), refRate: refRate.get(code), withheld });
+  };
+  (data.purchases || []).forEach((r) => check("Purchase Journal", r, r.supplier, r.invNo, num(r.ewt)));
+  (data.disbursements || []).forEach((r) => check("Cash Disbursements", r, r.vendor, r.cvNo, num(r.ewt)));
+  (data.receipts || []).forEach((r) => check("Cash Receipts", r, r.from, r.orNo, num(r.cwt)));
+  return out.sort((a, b) => dateSortKey(a.date) - dateSortKey(b.date) || a.journal.localeCompare(b.journal));
+}
+
+function AtcRateReviewNotice({ data, setData }) {
+  const rows = useMemo(() => profFeeRateMismatches(data), [data.atc, data.purchases, data.disbursements, data.receipts]);
+  const [open, setOpen] = useState(false);
+  if (rows.length === 0 || (data.dismissedNotices || {}).atcProfFeeRates) return null;
+  const pct = (r) => `${round2(r * 100)}%`;
+  const dismiss = () => setData((d) => ({ ...d, dismissedNotices: { ...(d.dismissedNotices || {}), atcProfFeeRates: true } }));
+  return (
+    <div className="vs-check warn ewt-notice">
+      <div className="vs-check-head"><Info size={14} /> Review {rows.length} professional-fee transaction{rows.length === 1 ? "" : "s"} recorded at a different rate than the ATC Reference</div>
+      <div className="vs-check-causes">
+        The default rates for WI010, WI011, WC010 and WC011 were swapped in earlier versions and have now been corrected. Transactions already entered keep the rate and EWT they were saved with, so check each one below and fix it on its journal page if needed (and any 2307 already issued).
+      </div>
+      <div className="ewt-notice-actions">
+        <button className="io-btn" onClick={() => setOpen((o) => !o)}>{open ? "Hide list" : "Show list"}</button>
+        <button className="io-btn" onClick={dismiss}>Dismiss</button>
+      </div>
+      {open && (
+        <div className="table-scroll ewt-notice-table">
+          <table className="ledger-table report-table">
+            <thead><tr><th>Date</th><th>Journal</th><th>Payee / Payor</th><th>Ref.</th><th>ATC</th><th className="num-head">Row rate</th><th className="num-head">ATC rate now</th><th className="num-head">EWT / CWT on row</th></tr></thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id}><td>{r.date || "—"}</td><td>{r.journal}</td><td>{r.party || "—"}</td><td>{r.ref || "—"}</td><td>{r.atc}</td>
+                  <td className="num">{pct(r.rowRate)}</td><td className="num">{pct(r.refRate)}</td><td className="num">{fmtPlain(r.withheld)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const ewtDate = (s) => { const d = parseAppDate(s); return d ? new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())) : null; };
+
+async function exportEwtScheduleExcel(data, s) {
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet("EWT");
+  const NUMFMT = '_(* #,##0.00_);_(* \\(#,##0.00\\);_(* "-"??_);_(@_)';
+  const DATEFMT = "[$-3409]dd-mmm-yy;@";
+  const FONT = { name: "Calibri", size: 9 };
+  const thin = { style: "thin", color: { argb: "FF000000" } };
+  const BORDER = { top: thin, left: thin, bottom: thin, right: thin };
+  const QFILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFA9D08E" } }; // template: accent 6, 40% tint
+  const TFILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC6E0B4" } }; // template: accent 6, 60% tint
+  const L = (n) => excelColLetter(n);
+
+  // Column plan (template: A month, B..M six groups, N..O TOTAL, P PAID, Q PAYABLE, R..U filing details).
+  // The optional Other pair slots in before TOTAL and shifts everything after it.
+  const GROUP_WIDTHS = { "Rentals 5%": [11.82, 12.45], "Goods 1%": [14.54, 11], "Services 2%": [13.82, 10.73], "Professional 5%": [10.54, 10.54],
+    "Professional 10%": [10, 10], "Professional 15%": [10.82, 10.45], Other: [11, 11] };
+  let col = 2;
+  const gCols = s.groups.map((g) => { const c = { g, base: L(col), ewt: L(col + 1) }; col += 2; return c; });
+  const tot = { base: L(col), ewt: L(col + 1) }; col += 2;
+  const C = { paid: L(col), payable: L(col + 1), dateFiled: L(col + 2), datePaid: L(col + 3), bank: L(col + 4), refNo: L(col + 5) };
+  const lastCol = col + 5;
+  ws.getColumn(1).width = 13.18;
+  gCols.forEach((c) => { const [wb1, we] = GROUP_WIDTHS[c.g]; ws.getColumn(c.base).width = wb1; ws.getColumn(c.ewt).width = we; });
+  ws.getColumn(tot.base).width = 14.45; ws.getColumn(tot.ewt).width = 10.73;
+  [12.45, 11.27, 10.82, 11, 11, 11].forEach((w, i) => { ws.getColumn(col + i).width = w; });
+
+  const put = (addr, value, opts = {}) => {
+    const c = ws.getCell(addr);
+    c.value = value;
+    c.font = { ...(opts.font || FONT), bold: !!opts.bold };
+    if (opts.fmt) c.numFmt = opts.fmt;
+    if (opts.border) c.border = BORDER;
+    if (opts.fill) c.fill = opts.fill;
+    if (opts.align) c.alignment = opts.align;
+  };
+  const f = (formula, result) => ({ formula, result: round2(result || 0) });
+  const HC = { horizontal: "center", vertical: "middle", wrapText: true };
+
+  put("A1", data.company.name || "COMPANY NAME");
+  put("A2", `SCHEDULE OF EWT ${s.year}`);
+  // Row 4: merged group headers; row 5: sub-headers (template has no row-4 header over PAID..REF. NO.).
+  [...gCols.map((c) => [c, ewtGroupHeader(c.g)]), [tot, "TOTAL"]].forEach(([c, label]) => {
+    put(`${c.base}4`, label, { bold: true, border: true, align: HC });
+    put(`${c.ewt}4`, label, { bold: true, border: true, align: HC });
+    ws.mergeCells(`${c.base}4:${c.ewt}4`);
+    put(`${c.base}5`, "Tax Base", { bold: true, border: true, align: HC });
+    put(`${c.ewt}5`, "EWT", { bold: true, border: true, align: HC });
+  });
+  put("A5", "Month", { bold: true, border: true, align: HC });
+  [["paid", "PAID"], ["payable", "PAYABLE"], ["dateFiled", "DATE FILED"], ["datePaid", "DATE PAID"], ["bank", "BANK"], ["refNo", "REF. NO."]]
+    .forEach(([k, label]) => put(`${C[k]}5`, label, { bold: true, border: true, align: HC }));
+
+  // Rows 6..: Jan-Mar, 1st Qtr, ... (the template's prior-year row 6 with wrong rates is dropped).
+  const FIRST = 6;
+  const monthRow = (i) => FIRST + Math.floor(i / 3) * 4 + (i % 3);
+  const qRow = (q) => FIRST + q * 4 + 3;
+  const totalRow = FIRST + 16;
+  const totalsFormulas = (r) => ({
+    base: gCols.map((c) => `${c.base}${r}`).join("+"),
+    ewt: gCols.map((c) => `${c.ewt}${r}`).join("+"),
+  });
+  s.months.forEach((m, i) => {
+    const r = monthRow(i);
+    const o = { fmt: NUMFMT, border: true };
+    put(`A${r}`, MONTHS[i], { border: true });
+    gCols.forEach((c) => { put(`${c.base}${r}`, round2(m.base[c.g]), o); put(`${c.ewt}${r}`, round2(m.ewt[c.g]), o); });
+    const tf = totalsFormulas(r);
+    put(`${tot.base}${r}`, f(tf.base, m.totalBase), o);
+    put(`${tot.ewt}${r}`, f(tf.ewt, m.totalEwt), o);
+    const paidRaw = m.input.paid;
+    put(`${C.paid}${r}`, paidRaw === undefined || paidRaw === "" || paidRaw === null ? null : round2(num(paidRaw)), o);
+    put(`${C.payable}${r}`, f(`${tot.ewt}${r}-${C.paid}${r}`, m.payable), o);
+    put(`${C.dateFiled}${r}`, ewtDate(m.input.dateFiled), { fmt: DATEFMT, border: true });
+    put(`${C.datePaid}${r}`, ewtDate(m.input.datePaid), { fmt: DATEFMT, border: true });
+    put(`${C.bank}${r}`, m.input.bank || null, { border: true });
+    put(`${C.refNo}${r}`, m.input.refNo || null, { border: true });
+  });
+  s.quarters.forEach((Q, q) => {
+    const r = qRow(q), r1 = monthRow(q * 3), r3 = r1 + 2;
+    const o = { fmt: NUMFMT, border: true, fill: QFILL };
+    const sum3 = (cl) => `${cl}${r1}+${cl}${r1 + 1}+${cl}${r3}`;
+    put(`A${r}`, EWT_QUARTER_LABELS[q], { border: true, fill: QFILL });
+    gCols.forEach((c) => { put(`${c.base}${r}`, f(sum3(c.base), Q.base[c.g]), o); put(`${c.ewt}${r}`, f(sum3(c.ewt), Q.ewt[c.g]), o); });
+    const tf = totalsFormulas(r);
+    put(`${tot.base}${r}`, f(tf.base, Q.totalBase), o);
+    put(`${tot.ewt}${r}`, f(tf.ewt, Q.totalEwt), o);
+    put(`${C.paid}${r}`, f(`SUM(${C.paid}${r1}:${C.paid}${r3})`, Q.paid), o);
+    put(`${C.payable}${r}`, f(`${tot.ewt}${r}-${C.paid}${r}`, Q.payable), o);
+    ["dateFiled", "datePaid", "bank", "refNo"].forEach((k) => put(`${C[k]}${r}`, null, { border: true, fill: QFILL }));
+  });
+  {
+    const r = totalRow, T = s.total;
+    const o = { fmt: NUMFMT, border: true, fill: TFILL, bold: true, font: { name: "Arial", size: 9 } };
+    const qSum = (cl) => [0, 1, 2, 3].map((q) => `${cl}${qRow(q)}`).join("+");
+    put(`A${r}`, "TOTAL", { ...o, fmt: undefined });
+    gCols.forEach((c) => { put(`${c.base}${r}`, f(qSum(c.base), T.base[c.g]), o); put(`${c.ewt}${r}`, f(qSum(c.ewt), T.ewt[c.g]), o); });
+    put(`${tot.base}${r}`, f(qSum(tot.base), T.totalBase), o);
+    put(`${tot.ewt}${r}`, f(qSum(tot.ewt), T.totalEwt), o);
+    put(`${C.paid}${r}`, f(qSum(C.paid), T.paid), o);
+    put(`${C.payable}${r}`, f(`${tot.ewt}${r}-${C.paid}${r}`, T.payable), o);
+    ["dateFiled", "datePaid", "bank", "refNo"].forEach((k) => put(`${C[k]}${r}`, null, { border: true, fill: TFILL }));
+  }
+
+  // Summary per ATC, below the main table (same relative spacing as the template).
+  const sTitle = totalRow + 4, sHead = sTitle + 2, sFirst = sHead + 1, sLast = sFirst + s.summary.length - 1;
+  put(`A${sTitle}`, "SUMMARY PER ATC", { bold: true });
+  [["A", "ATC"], ["B", "TAX BASE"], ["C", "EWT"], ["D", "DESCRIPTION"]].forEach(([cl, label]) => put(`${cl}${sHead}`, label, { bold: true, border: true, align: HC }));
+  s.summary.forEach((a, i) => {
+    const r = sFirst + i;
+    put(`A${r}`, a.code, { border: true });
+    put(`B${r}`, round2(a.taxBase), { fmt: NUMFMT, border: true });
+    put(`C${r}`, round2(a.ewt), { fmt: NUMFMT, border: true });
+    put(`D${r}`, a.desc, { border: true });
+  });
+  put(`A${sLast + 1}`, "TOTAL", { bold: true, border: true });
+  put(`B${sLast + 1}`, f(`SUM(B${sFirst}:B${sLast})`, s.summaryTotal.taxBase), { fmt: NUMFMT, border: true, bold: true });
+  put(`C${sLast + 1}`, f(`SUM(C${sFirst}:C${sLast})`, s.summaryTotal.ewt), { fmt: NUMFMT, border: true, bold: true });
+
+  ws.pageSetup = { orientation: "landscape", paperSize: 9, fitToPage: true, fitToWidth: 1, fitToHeight: 1, printArea: `A1:${L(lastCol)}${sLast + 1}`,
+    margins: { left: 0.25, right: 0.25, top: 0.75, bottom: 0.75, header: 0.3, footer: 0.3 } };
+  await saveExcelBuffer(wb, `EWT-Schedule-${s.year}-${todayFileStamp()}.xlsx`);
+}
+
+async function exportEwtSchedulePDF(data, s) {
+  const jsPDFCtor = await withTimeout(loadJsPDF(), 8000);
+  const doc = new jsPDFCtor({ orientation: "landscape", unit: "mm", format: "a4" });
+  doc.setFontSize(11); doc.setFont(undefined, "bold");
+  doc.text(data.company.name || "Your Company Name Inc.", 8, 11);
+  doc.setFontSize(9); doc.setFont(undefined, "normal");
+  doc.text(`Schedule of EWT ${s.year} — Printed ${todayMDY()}`, 8, 16);
+  const head = [
+    [{ content: "MONTH", rowSpan: 2 }, ...s.groups.map((g) => ({ content: ewtGroupHeader(g), colSpan: 2 })), { content: "TOTAL", colSpan: 2 },
+      ...["PAID", "PAYABLE", "DATE FILED", "DATE PAID", "BANK", "REF. NO."].map((h) => ({ content: h, rowSpan: 2 }))],
+    [...s.groups.flatMap(() => ["Tax Base", "EWT"]), "Tax Base", "EWT"],
+  ];
+  const rows = ewtScheduleRows(s);
+  const body = rows.map((row) => {
+    const v = row.v, inp = row.kind === "month" ? v.input : {};
+    return [row.label, ...s.groups.flatMap((g) => [fmtAcct(v.base[g]), fmtAcct(v.ewt[g])]), fmtAcct(v.totalBase), fmtAcct(v.totalEwt),
+      row.kind === "month" && (inp.paid === undefined || inp.paid === "") ? "" : fmtAcct(v.paid), fmtAcct(v.payable),
+      inp.dateFiled || "", inp.datePaid || "", inp.bank || "", inp.refNo || ""];
+  });
+  const numericEnd = 1 + s.groups.length * 2 + 2 + 2; // MONTH + groups + TOTAL + PAID/PAYABLE
+  doc.autoTable({
+    head, body, startY: 20, margin: { left: 6, right: 6 }, theme: "grid",
+    styles: { fontSize: 5.6, cellPadding: 0.8, overflow: "linebreak", lineWidth: 0.1 },
+    headStyles: { fillColor: [31, 95, 168], textColor: 255, fontStyle: "bold", halign: "center", valign: "middle" },
+    columnStyles: Object.fromEntries(Array.from({ length: numericEnd }, (_, i) => [i, { halign: i === 0 ? "left" : "right" }])),
+    didParseCell: (h) => {
+      if (h.section !== "body") return;
+      const kind = rows[h.row.index].kind;
+      if (kind === "quarter") { h.cell.styles.fillColor = [255, 243, 160]; h.cell.styles.fontStyle = "bold"; }
+      if (kind === "total") { h.cell.styles.fillColor = [255, 214, 150]; h.cell.styles.fontStyle = "bold"; }
+    },
+  });
+  doc.setFontSize(9); doc.setFont(undefined, "bold");
+  let y = doc.lastAutoTable.finalY + 8;
+  if (y > 180) { doc.addPage(); y = 14; }
+  doc.text("SUMMARY PER ATC", 8, y);
+  doc.setFont(undefined, "normal");
+  doc.autoTable({
+    head: [["ATC", "Description", "Tax Base", "EWT"]],
+    body: s.summary.map((a) => [a.code, a.desc, fmtAcct(a.taxBase), fmtAcct(a.ewt)]),
+    foot: [["TOTAL", "", fmtAcct(s.summaryTotal.taxBase), fmtAcct(s.summaryTotal.ewt)]],
+    startY: y + 3, margin: { left: 6, right: 6 }, tableWidth: 190, theme: "grid",
+    styles: { fontSize: 6.5, cellPadding: 1 },
+    headStyles: { fillColor: [31, 95, 168], textColor: 255, fontStyle: "bold" },
+    footStyles: { fillColor: [255, 214, 150], textColor: [61, 38, 0], fontStyle: "bold" },
+    columnStyles: { 0: { cellWidth: 18 }, 2: { halign: "right", cellWidth: 32 }, 3: { halign: "right", cellWidth: 28 } },
+  });
+  doc.save(`EWT-Schedule-${s.year}-A4-${todayFileStamp()}.pdf`);
+}
+
+function EwtSchedulePage({ data, setData, postings }) {
+  const [year, setYear] = useState(new Date().getFullYear());
+  const sched = useMemo(() => computeEwtSchedule(data, year),
+    [data.purchases, data.disbursements, data.atc, data.ewtSchedule, year]);
+  const rows = ewtScheduleRows(sched);
+
+  const setMonth = (i, patch) => setData((d) => {
+    const all = d.ewtSchedule || {};
+    const yr = all[year] || {};
+    return { ...d, ewtSchedule: { ...all, [year]: { ...yr, [i]: { ...(yr[i] || {}), ...patch } } } };
+  });
+  // Fills PAID with the row's own EWT (one setData for all months of a quarter).
+  const markPaid = (idxs) => setData((d) => {
+    const all = d.ewtSchedule || {};
+    const yr = { ...(all[year] || {}) };
+    idxs.forEach((i) => { yr[i] = { ...(yr[i] || {}), paid: round2(sched.months[i].totalEwt) }; });
+    return { ...d, ewtSchedule: { ...all, [year]: yr } };
+  });
+
+  // Check strip: schedule vs QAP (same source rows) and vs credits posted to 2300 (EWT withheld).
+  const check = useMemo(() => {
+    let qap = 0, receiptsCwt = 0;
+    for (let q = 1; q <= 4; q++) {
+      [...buildQapRowsFromPurchases(data, q, year), ...buildQapRowsFromDisbursements(data, q, year)].forEach((r) => { qap += num(r.ewt); });
+      buildQapRowsFromReceipts(data, q, year).forEach((r) => { receiptsCwt += num(r.ewt); });
+    }
+    const start = new Date(year, 0, 1), end = monthEnd(year, 11);
+    let gl = 0;
+    postings.forEach((p) => { if (p.code === "2300" && inRange(p.date, start, end)) gl += p.credit; });
+    return { qap: round2(qap), receiptsCwt: round2(receiptsCwt), gl: round2(gl) };
+  }, [data, postings, year]);
+  const schedEwt = round2(sched.total.totalEwt);
+  const qapDiff = round2(schedEwt - check.qap), glDiff = round2(schedEwt - check.gl);
+  const summaryDiff = round2(sched.summaryTotal.ewt - sched.total.totalEwt) || round2(sched.summaryTotal.taxBase - sched.total.totalBase);
+  const reconciled = Math.abs(qapDiff) < 1 && Math.abs(glDiff) < 1;
+
+  const reportExport = useReportExport(() => exportEwtSchedulePDF(data, sched), () => exportEwtScheduleExcel(data, sched));
+  const exportHook = { exportPDF: reportExport.exportPDF, exportExcel: reportExport.exportExcel };
+
+  const paidCell = (row) => {
+    const v = row.v;
+    if (row.kind === "month") {
+      const canMark = Math.abs(v.totalEwt) >= 0.005 && Math.abs(v.payable) >= 0.005;
+      return (
+        <td className="vs-input">
+          <Field type="number" align="right" value={v.input.paid ?? ""} onChange={(x) => setMonth(v.idx, { paid: x })} />
+          {canMark && <div className="vs-input-note"><button className="vs-link" onClick={() => markPaid([v.idx])} title="Fill PAID with this month's EWT">mark paid in full</button></div>}
+        </td>
+      );
+    }
+    const canMark = row.kind === "quarter" && Math.abs(v.payable) >= 0.005 && Math.abs(v.totalEwt) >= 0.005;
+    return (
+      <td className="num">
+        {fmtAcct(v.paid)}
+        {canMark && <div className="vs-input-note"><button className="vs-link" onClick={() => markPaid([0, 1, 2].map((k) => v.q * 3 + k))} title="Fill PAID on each month of this quarter with that month's EWT">mark quarter paid</button></div>}
+      </td>
+    );
+  };
+  const inputCell = (row, key, type) => {
+    if (row.kind !== "month") return <td key={key}></td>;
+    const v = row.v;
+    return (
+      <td key={key} className="vs-input ewt-detail">
+        <Field type={type} options={type === "select" ? BANK_ACCOUNTS : undefined} value={v.input[key] || ""} onChange={(x) => setMonth(v.idx, { [key]: x })} />
+      </td>
+    );
+  };
+
+  return (
+    <div>
+      <SectionHeader icon={Percent} title="EWT Schedule" subtitle="Expanded withholding tax by rate group, per month and quarter, from the same rows as the QAP (Purchase Journal and Cash Disbursements with an ATC). A monitoring schedule for the 0619-E and 1601-EQ; it doesn't generate those forms."
+        right={<div className="header-actions">
+          <ExportBar exportHook={exportHook} />
+          <select className="year-select" value={year} onChange={(e) => setYear(Number(e.target.value))}>{getAvailableYears(data).map((y) => <option key={y} value={y}>{y}</option>)}</select>
+        </div>} />
+      <ExportStatus status={reportExport.status} />
+      <AtcRateReviewNotice data={data} setData={setData} />
+      <div className="pc-hint"><Info size={13} /> Type PAID and the filing details per month. PAID starts blank, so PAYABLE shows what is still outstanding. Rate groups come from each code's EWT Group in ATC Reference.</div>
+      <div className="ledger-wrap">
+        <div className="table-scroll vs-scroll">
+          <table className="ledger-table report-table vs-table">
+            <thead>
+              <tr>
+                <th rowSpan={2} className="vs-sticky">Month</th>
+                {sched.groups.map((g) => <th key={g} colSpan={2} className={"vs-grp" + (g === "Other" ? " ewt-grp-other" : "")}>{ewtGroupHeader(g)}</th>)}
+                <th colSpan={2} className="vs-grp vs-grp-sales">Total</th>
+                <th rowSpan={2} className="num-head">Paid</th><th rowSpan={2} className="num-head">Payable</th>
+                <th rowSpan={2}>Date Filed</th><th rowSpan={2}>Date Paid</th><th rowSpan={2}>Bank</th><th rowSpan={2}>Ref. No.</th>
+              </tr>
+              <tr>
+                {[...sched.groups, "TOTAL"].flatMap((g) => [<th key={g + "b"} className="num-head">Tax Base</th>, <th key={g + "e"} className="num-head">EWT</th>])}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.label} className={row.kind === "quarter" ? "vs-quarter" : row.kind === "total" ? "vs-total" : ""}>
+                  <td className="vs-sticky">{row.label}</td>
+                  {sched.groups.flatMap((g) => [<td key={g + "b"} className="num">{fmtAcct(row.v.base[g])}</td>, <td key={g + "e"} className="num">{fmtAcct(row.v.ewt[g])}</td>])}
+                  <td className="num">{fmtAcct(row.v.totalBase)}</td><td className="num">{fmtAcct(row.v.totalEwt)}</td>
+                  {paidCell(row)}
+                  <td className="num">{fmtAcct(row.v.payable)}</td>
+                  {inputCell(row, "dateFiled", "date")}
+                  {inputCell(row, "datePaid", "date")}
+                  {inputCell(row, "bank", "select")}
+                  {inputCell(row, "refNo", "text")}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="ewt-summary">
+        <div className="ewt-summary-head">
+          <h3>Summary per ATC — {year}</h3>
+          {Math.abs(summaryDiff) < 0.01
+            ? <span className="td-tag reclass"><Check size={11} /> Reconciled with the TOTAL row</span>
+            : <span className="td-tag ewt-tag-warn">Differs from the TOTAL row by {fmtParen(summaryDiff)}</span>}
+        </div>
+        <div className="table-scroll">
+          <table className="ledger-table report-table ewt-summary-table">
+            <thead><tr><th>ATC</th><th>Description</th><th>EWT Group</th><th className="num-head">Tax Base</th><th className="num-head">EWT</th></tr></thead>
+            <tbody>
+              {sched.summary.map((a) => (
+                <tr key={a.code}><td>{a.code}</td><td className="ewt-desc">{a.desc || "—"}</td><td>{a.group}</td>
+                  <td className="num">{fmtAcct(a.taxBase)}</td><td className="num">{fmtAcct(a.ewt)}</td></tr>
+              ))}
+            </tbody>
+            <tfoot><tr><td colSpan={3} className="totals-label">TOTAL</td><td className="num">{fmtAcct(sched.summaryTotal.taxBase)}</td><td className="num">{fmtAcct(sched.summaryTotal.ewt)}</td></tr></tfoot>
+          </table>
+        </div>
+      </div>
+
+      <div className={"vs-check " + (reconciled ? "ok" : "warn")}>
+        <div className="vs-check-head">{reconciled ? <><Check size={14} /> Reconciled with the QAP and the General Ledger</> : <><Info size={14} /> Doesn't tie out</>}</div>
+        <div className="vs-check-grid">
+          <span></span><span className="vs-check-col">Schedule EWT</span><span className="vs-check-col">Compared to</span><span className="vs-check-col">Difference</span>
+          <span>QAP {year} (Purchase Journal + Cash Disbursements)</span><span className="num">{fmtPlain(schedEwt)}</span><span className="num">{fmtPlain(check.qap)}</span><span className="num">{fmtParen(qapDiff)}</span>
+          <span>Credits posted to 2300 (EWT withheld)</span><span className="num">{fmtPlain(schedEwt)}</span><span className="num">{fmtPlain(check.gl)}</span><span className="num">{fmtParen(glDiff)}</span>
+        </div>
+        {!reconciled && (
+          <div className="vs-check-causes">
+            Likely causes: manual General Journal credits to 2300; purchases with EWT but no ATC (they post to 2300 but aren't on the QAP or this schedule); or entries dated outside {year}.
+          </div>
+        )}
+        {check.receiptsCwt > 0 && (
+          <div className="vs-check-causes">
+            Note: the QAP page also adds {fmtPlain(check.receiptsCwt)} of Cash Receipts CWT for {year}. That is tax withheld from the company, not by it, so this schedule leaves it out.
+          </div>
+        )}
       </div>
     </div>
   );
@@ -5698,8 +6545,8 @@ function useReportExport(pdfFn, excelFn) {
     catch (e) { setStatus({ type: "error", text: "Couldn't generate the PDF report — this needs an internet connection the first time. Please check your connection and try again." }); }
     setTimeout(() => setStatus(null), 5000);
   };
-  const exportExcel = () => {
-    try { excelFn(); setStatus({ type: "success", text: "Excel report downloaded." }); }
+  const exportExcel = async () => {
+    try { await excelFn(); setStatus({ type: "success", text: "Excel report downloaded." }); }
     catch (e) { setStatus({ type: "error", text: "Couldn't generate the Excel report." }); }
     setTimeout(() => setStatus(null), 4000);
   };
@@ -7722,6 +8569,15 @@ function buildSlsRowsFromSales(data, month, year) {
   return rows;
 }
 
+// Which SLSPI bucket a Purchase Journal row falls in, from its VAT Type's SLSPI Field. Shared by
+// the SLP and the VAT Schedule so the two reports can never classify a purchase differently.
+// A row with no VAT Type selected yet counts as "Services" (the SLP's long-standing default); a VAT
+// Type with a blank SLSPI Field (e.g. "0% Non-VAT purchases") returns "" and lands in no bucket.
+function purchaseSlspiField(data, r) {
+  const vt = (data.vatTypes || []).find((v) => v.vatType === r.vatType);
+  return vt ? (vt.slspiField || "") : "Services";
+}
+
 function buildSlpRowsFromPurchases(data, month, year) {
   const start = new Date(year, month - 1, 1), end = monthEnd(year, month - 1);
   const relevant = data.purchases.filter((r) => inRange(r.date, start, end));
@@ -7745,8 +8601,7 @@ function buildSlpRowsFromPurchases(data, month, year) {
     const g = groups.get(key);
     g.inputVat += num(r.inputVat);
     const amt = round2(num(r.vatable) + num(r.nonvat));
-    const vt = data.vatTypes.find((v) => v.vatType === r.vatType);
-    const slspiField = vt ? vt.slspiField : "Services"; // no VAT Type selected yet — default matches prior behavior
+    const slspiField = purchaseSlspiField(data, r);
     if (slspiField === "Capital goods") g.capitalGoods += amt;
     else if (slspiField === "Other than capital goods") g.otherCapitalGoods += amt;
     else if (slspiField === "Exempt") g.vatExempt += amt;
@@ -7770,62 +8625,53 @@ function buildSliRowsFromImportation(data, month, year) {
   return rows;
 }
 
-// ATC-tagged Purchase Journal entries are the basis for QAP — one row per transaction, carrying
-// its own actual date so no "relative month" guessing is needed like the old upload path required.
-function buildQapRowsFromPurchases(data, quarter, year) {
-  const startMonth = (quarter - 1) * 3 + 1;
-  const endMonth = startMonth + 2;
-  const rows = [];
-  data.purchases.forEach((r) => {
+// The expanded-withholding source rows shared by QAP and the EWT Schedule, so the two always agree:
+//   - Purchase Journal rows with an ATC: tax base = vatable + nonvat
+//   - Cash Disbursements rows with an ATC AND EWT > 0 (a disbursement can carry an ATC with ₱0 EWT if
+//     the rate or amount is blank, which shouldn't count): tax base = amount
+// EWT is always the row's actual `ewt`, never re-derived from a rate.
+function ewtSourceRows(data) {
+  const out = [];
+  (data.purchases || []).forEach((r) => {
     if (!r.atc) return;
-    const d = parseAppDate(r.date);
-    if (!d) return;
-    const m = d.getMonth() + 1, y = d.getFullYear();
-    if (y !== year || m < startMonth || m > endMonth) return;
-    const supp = data.suppliers.find((s) => (s.name || "").toLowerCase() === (r.supplier || "").toLowerCase());
-    const isIndiv = supp && supp.type === "Individual";
-    const tin = ((supp && supp.tin) || r.tin || "").replace(/\D/g, "");
-    rows.push({
-      tin, branchCode: "0000",
-      partyName: isIndiv ? "" : ((supp && (supp.name || supp.registeredName)) || r.supplier || ""),
-      surname: isIndiv ? supp.surname : "", firstName: isIndiv ? supp.firstName : "", middleName: isIndiv ? supp.middleName : "",
-      atc: r.atc, rate: num(r.atcRate), taxBase: round2(num(r.vatable) + num(r.nonvat)), ewt: num(r.ewt),
-      monthInfo: { month: m, year: y, relative: false },
-      sortKey: reliefPartySortKey(supp, r.supplier),
-    });
+    out.push({ date: r.date, atc: r.atc, taxBase: round2(num(r.vatable) + num(r.nonvat)), ewt: num(r.ewt), rate: num(r.atcRate), source: "purchases", party: r.supplier, row: r });
   });
-  rows.sort((a, b) => (a.sortKey || "").localeCompare(b.sortKey || "") || a.monthInfo.month - b.monthInfo.month);
-  return rows;
+  (data.disbursements || []).forEach((r) => {
+    if (!r.atc || !(num(r.ewt) > 0)) return;
+    out.push({ date: r.date, atc: r.atc, taxBase: round2(num(r.amount)), ewt: num(r.ewt), rate: num(r.atcRate), source: "disbursements", party: r.vendor, row: r });
+  });
+  return out;
 }
 
-// Same idea as buildQapRowsFromPurchases, but for Cash Disbursements — only included when the row
-// actually has an ATC code AND a resulting EWT (a disbursement can carry an ATC with $0 EWT if the
-// rate or amount is blank, which shouldn't feed QAP).
-function buildQapRowsFromDisbursements(data, quarter, year) {
+// QAP rows for one source of ewtSourceRows — one row per transaction, carrying its own actual date
+// so no "relative month" guessing is needed like the old upload path required.
+function buildQapRowsFromEwtSource(data, quarter, year, source) {
   const startMonth = (quarter - 1) * 3 + 1;
   const endMonth = startMonth + 2;
   const rows = [];
-  data.disbursements.forEach((r) => {
-    if (!r.atc || !(num(r.ewt) > 0)) return;
-    const d = parseAppDate(r.date);
+  ewtSourceRows(data).forEach((e) => {
+    if (e.source !== source) return;
+    const d = parseAppDate(e.date);
     if (!d) return;
     const m = d.getMonth() + 1, y = d.getFullYear();
     if (y !== year || m < startMonth || m > endMonth) return;
-    const supp = data.suppliers.find((s) => (s.name || "").toLowerCase() === (r.vendor || "").toLowerCase());
+    const supp = data.suppliers.find((s) => (s.name || "").toLowerCase() === (e.party || "").toLowerCase());
     const isIndiv = supp && supp.type === "Individual";
-    const tin = ((supp && supp.tin) || r.tin || "").replace(/\D/g, "");
+    const tin = ((supp && supp.tin) || e.row.tin || "").replace(/\D/g, "");
     rows.push({
       tin, branchCode: "0000",
-      partyName: isIndiv ? "" : ((supp && (supp.name || supp.registeredName)) || r.vendor || ""),
+      partyName: isIndiv ? "" : ((supp && (supp.name || supp.registeredName)) || e.party || ""),
       surname: isIndiv ? supp.surname : "", firstName: isIndiv ? supp.firstName : "", middleName: isIndiv ? supp.middleName : "",
-      atc: r.atc, rate: num(r.atcRate), taxBase: round2(num(r.amount)), ewt: num(r.ewt),
+      atc: e.atc, rate: e.rate, taxBase: e.taxBase, ewt: e.ewt,
       monthInfo: { month: m, year: y, relative: false },
-      sortKey: reliefPartySortKey(supp, r.vendor),
+      sortKey: reliefPartySortKey(supp, e.party),
     });
   });
   rows.sort((a, b) => (a.sortKey || "").localeCompare(b.sortKey || "") || a.monthInfo.month - b.monthInfo.month);
   return rows;
 }
+const buildQapRowsFromPurchases = (data, quarter, year) => buildQapRowsFromEwtSource(data, quarter, year, "purchases");
+const buildQapRowsFromDisbursements = (data, quarter, year) => buildQapRowsFromEwtSource(data, quarter, year, "disbursements");
 
 // Cash Receipts entries with an ATC and a resulting CWT feed QAP too — the party here is looked
 // up in Customers Master (not Suppliers), since "Received From" ties to a customer/payor.
@@ -8274,6 +9120,49 @@ function Style() {
       .td-tag { font-size: 10.5px; padding: 3px 8px; border-radius: 20px; font-weight: 600; }
       .td-tag.reclass { background: #E3F0FC; color: var(--green-deep); }
       .td-tag.system { background: var(--paper-deep); color: var(--ink-soft); }
+      .vs-scroll { max-height: 72vh; overflow: auto; }
+      .vs-table { font-size: 11.5px; }
+      .vs-table th, .vs-table td { white-space: nowrap; }
+      .vs-table thead { position: sticky; top: 0; z-index: 3; }
+      .vs-table thead th { position: static; padding: 6px 8px; font-size: 10.5px; text-align: center; border: 1px solid var(--line); }
+      .vs-table thead th.num-head { text-align: center; }
+      .vs-table thead th.vs-wrap { white-space: normal; min-width: 96px; }
+      .vs-table thead .vs-grp-sales { background: #D6E2F5; }
+      .vs-table thead .vs-grp-purch { background: #E2E5EA; }
+      .vs-table thead .vs-grp-cap { background: #D5D9DF; }
+      .vs-table tbody td { padding: 5px 8px; color: var(--ink); border-right: 1px solid var(--line-soft); }
+      .vs-table tbody td.num { min-width: 104px; }
+      .vs-table .vs-sticky { position: sticky; left: 0; z-index: 2; background: var(--white); font-weight: 500; min-width: 120px; border-right: 1px solid var(--line); }
+      .vs-table thead th.vs-sticky { position: sticky; left: 0; z-index: 4; background: var(--paper-deep); }
+      .vs-table tbody tr.vs-quarter td { background: #FFF5C2; font-weight: 600; color: #3D3300; }
+      .vs-table tbody tr.vs-total td { background: #FFDDA6; font-weight: 700; color: #3D2600; border-top: 2px solid #E8A33D; }
+      .vs-table tbody tr.vs-opening td { background: var(--paper); color: var(--ink-soft); font-style: italic; }
+      .vs-table td.vs-input { padding: 1px 3px; min-width: 112px; }
+      .vs-table td.vs-input .ledger-field { border-color: var(--line); background: var(--white); font-style: normal; color: var(--ink); }
+      .vs-input-note { font-size: 10px; text-align: right; color: var(--ink-soft); padding: 0 4px 2px; font-style: normal; }
+      .vs-link { background: none; border: none; padding: 0; color: var(--green); font-size: 10px; cursor: pointer; text-decoration: underline; }
+      .vs-check { margin-top: 14px; border-radius: 9px; padding: 12px 14px; font-size: 12.5px; border: 1px solid; }
+      .vs-check.ok { background: #E6F4EA; border-color: #A8D5B5; color: #1E5631; }
+      .vs-check.warn { background: #FFF4DB; border-color: #F0C36D; color: #6B4A00; }
+      .vs-check-head { display: flex; align-items: center; gap: 7px; font-weight: 600; margin-bottom: 8px; }
+      .vs-check-grid { display: grid; grid-template-columns: minmax(220px, 1.6fr) repeat(3, minmax(110px, 1fr)); gap: 4px 14px; align-items: baseline; }
+      .vs-check-grid .num { font-family: 'IBM Plex Mono', monospace; text-align: right; }
+      .vs-check-col { font-size: 11px; font-weight: 600; text-align: right; opacity: 0.8; }
+      .vs-check-causes { margin-top: 9px; font-size: 12px; line-height: 1.5; }
+      @media (max-width: 640px) { .vs-check-grid { grid-template-columns: 1fr 1fr; } }
+      .vs-table thead .ewt-grp-other { background: #FCE3D6; }
+      .vs-table td.ewt-detail { min-width: 120px; }
+      .ewt-notice { margin: 0 0 12px; }
+      .ewt-notice-actions { display: flex; gap: 8px; margin-top: 9px; }
+      .ewt-notice-table { margin-top: 10px; background: var(--white); border: 1px solid var(--line); }
+      .ewt-notice-table td { padding: 5px 8px; color: var(--ink); }
+      .ewt-summary { margin-top: 16px; background: var(--white); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; max-width: 860px; }
+      .ewt-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+      .ewt-summary-head h3 { margin: 0; font-size: 14px; color: var(--green-deep); }
+      .ewt-summary-head .td-tag { display: inline-flex; align-items: center; gap: 4px; }
+      .ewt-tag-warn { background: #FFF4DB; color: #6B4A00; }
+      .ewt-summary-table td { padding: 5px 8px; }
+      .ewt-desc { color: var(--ink-soft); font-size: 11.5px; max-width: 380px; white-space: normal; }
       .pc-hint { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-soft); background: var(--paper-deep); border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; margin-bottom: 12px; }
       .pc-actions { display: flex; align-items: center; gap: 6px; }
       .pc-actions .io-btn { padding: 5px 9px; }
