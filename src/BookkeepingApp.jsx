@@ -6428,7 +6428,7 @@ function buildSlspiRecord(subMode, d, sourceRows) {
     const dRows = sourceRows.map((r) => ["D", marker, r.tin, reliefClean(r.partyName), reliefClean(r.surname), reliefClean(r.firstName), reliefClean(r.middleName),
       reliefClean(r.address1), reliefClean(r.address2), numf(r.vatExempt), numf(r.zeroRated), numf(r.services), numf(r.capitalGoods),
       numf(r.otherCapitalGoods), numf(r.inputVat), d.companyTin, returnPeriod, "", "", "", "", ""]);
-    return { hRow, dRows, cRow: null, totals, totalLabel: "Total Input VAT", totalVal: totals.inputVat, returnPeriod, filename: `${d.companyTin}${marker}${pad2(d.month)}${d.year}_SLP.dat` };
+    return { hRow, dRows, cRow: null, totals, totalLabel: "Total Input VAT", totalVal: totals.inputVat, returnPeriod, filename: `${d.companyTin}${marker}${pad2(d.month)}${d.year}.dat` };
   }
   if (subMode === "SLS") {
     const fmt2 = (n) => Number(n).toFixed(2);
@@ -6442,7 +6442,7 @@ function buildSlspiRecord(subMode, d, sourceRows) {
       truncInt(totals.exemptSales), truncInt(totals.zeroRatedSales), truncInt(totals.taxableSales), truncInt(totals.outputVat), d.rdoCode, returnPeriod, "12"];
     const dRows = sourceRows.map((r) => ["D", marker, reliefPadTin(r.tin), reliefClean(r.partyName), reliefClean(r.surname), reliefClean(r.firstName), reliefClean(r.middleName),
       reliefClean(r.address1), reliefClean(r.address2), fmt2(r.exemptSales), fmt2(r.zeroRatedSales), fmt2(r.taxableSales), fmt2(r.outputVat), d.companyTin, returnPeriod, "", ""]);
-    return { hRow, dRows, cRow: null, totals, totalLabel: "Total Output VAT", totalVal: totals.outputVat, returnPeriod, filename: `${d.companyTin}${marker}${pad2(d.month)}${d.year}_SLS.dat` };
+    return { hRow, dRows, cRow: null, totals, totalLabel: "Total Output VAT", totalVal: totals.outputVat, returnPeriod, filename: `${d.companyTin}${marker}${pad2(d.month)}${d.year}.dat` };
   }
   const q = (s) => `"${reliefClean(s).replace(/"/g, "")}"`;
   const numf = (n) => String(n);
@@ -6456,7 +6456,7 @@ function buildSlspiRecord(subMode, d, sourceRows) {
     fmt2(totals.totalLandedCost), fmt2(totals.otherCharges), fmt2(totals.exempt), fmt2(totals.taxable), fmt2(totals.vat), d.rdoCode, returnPeriod, "12"];
   const dRows = sourceRows.map((r) => ["D", marker, q(r.importEntryNo), r.assessmentDate, q(r.suppliersName), r.importationDate,
     q(r.countryOrigin), numf(r.totalLandedCost), numf(r.otherCharges), numf(r.exempt), numf(r.taxable), numf(r.vat), q(r.orNumber), r.vatPaymentDate, d.companyTin, returnPeriod]);
-  return { hRow, dRows, cRow: null, totals, totalLabel: "Total VAT", totalVal: totals.vat, returnPeriod, filename: `${d.companyTin}${marker}${pad2(d.month)}${d.year}_SLI.dat` };
+  return { hRow, dRows, cRow: null, totals, totalLabel: "Total VAT", totalVal: totals.vat, returnPeriod, filename: `${d.companyTin}${marker}${pad2(d.month)}${d.year}.dat` };
 }
 
 function reliefResolveRowMonthYear(r, d) {
