@@ -1884,6 +1884,10 @@ function DelBtn({ onClick }) {
   return <button onClick={onClick} className="del-btn" title="Delete row"><Trash2 size={13} /></button>;
 }
 
+function EditBtn({ onClick, disabled, title }) {
+  return <button onClick={onClick} className="edit-btn" disabled={disabled} title={title || "Edit in form (all fields, add lines)"}><Pencil size={13} /></button>;
+}
+
 /* ============================== MASTER TABLE (generic) ============================== */
 
 async function downloadMasterTemplate(title, columns, rows, data) {
@@ -2856,39 +2860,111 @@ function ComputedPreview({ items }) {
   );
 }
 
-function SalesEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), siNo: "", customer: "", tin: "", address: "", desc: "", vatable: 0, exempt: 0, zeroRated: 0, terms: "Cash", coaCode: "4000", bankAccount: "Cash on Hand" });
-  const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+// Multi-line entries are stored as one journal row per line. Rows saved from an entry form share an
+// entryId; older rows are recognised by the "(i/n)" suffix the form appends to their reference number,
+// together with the same date and party. Editing an entry swaps the whole group for the re-saved rows.
+const MULTI_LINE_REF_SUFFIX = /\s*\(\d+\/\d+\)$/;
+const stripLineRefSuffix = (ref) => String(ref || "").replace(MULTI_LINE_REF_SUFFIX, "");
+const lineRef = (ref, i, n) => n > 1 ? `${ref}${ref ? " " : ""}(${i + 1}/${n})` : ref;
+
+function findEntryGroup(rows, row, refKey, partyKey) {
+  if (row.entryId) return rows.filter((r) => r.entryId === row.entryId);
+  if (!MULTI_LINE_REF_SUFFIX.test(row[refKey] || "")) return [row];
+  const base = stripLineRefSuffix(row[refKey]);
+  return rows.filter((r) => !r.entryId && r.date === row.date && r[partyKey] === row[partyKey]
+    && MULTI_LINE_REF_SUFFIX.test(r[refKey] || "") && stripLineRefSuffix(r[refKey]) === base);
+}
+
+// Puts newRows where the first of the old rows sat, so an edited entry keeps its place in the journal.
+function replaceEntryRows(rows, oldIds, newRows) {
+  const ids = new Set(oldIds);
+  const at = rows.findIndex((r) => ids.has(r.id));
+  const kept = rows.filter((r) => !ids.has(r.id));
+  if (at < 0) return [...kept, ...newRows];
+  return [...kept.slice(0, at), ...newRows, ...kept.slice(at)];
+}
+
+// Line ids double as row ids, so rows that other books point at (e.g. Applied to Invoice) stay linked
+// through an edit. Fields the form doesn't show are carried over from the original row.
+function expandEntryLines(lines, initialRows, build) {
+  const byId = Object.fromEntries((initialRows || []).map((r) => [r.id, r]));
+  const entryId = (initialRows && initialRows[0] && initialRows[0].entryId) || uid();
+  return lines.map((l, i) => ({ ...(byId[l.id] || {}), ...build(l, i, lines.length), id: l.id, entryId }));
+}
+
+function LinesCard({ index, count, onRemove, foot, children }) {
+  return (
+    <div className="ml-line-card">
+      <div className="ml-line-head">
+        <span>Line {index + 1}</span>
+        {count > 1 && <button type="button" className="del-btn" onClick={onRemove}><X size={13} /></button>}
+      </div>
+      <div className="ml-line-grid">{children}</div>
+      {foot && <div className="ml-line-foot">{foot}</div>}
+    </div>
+  );
+}
+
+const entrySubmitLabel = (editing, n, noun) => editing ? (n > 1 ? `Save ${n} lines` : "Save changes") : (n > 1 ? `Add ${n} lines` : `Add ${noun}`);
+
+const mkSalesLine = () => ({ id: uid(), desc: "", vatable: 0, exempt: 0, zeroRated: 0, coaCode: "4000" });
+
+function SalesEntryModal({ data, setData, initialRows, onCancel, onSubmit }) {
+  const editing = !!(initialRows && initialRows.length);
+  const first = editing ? initialRows[0] : null;
+  const [h, setH] = useState(first
+    ? { date: first.date, siNo: stripLineRefSuffix(first.siNo), customer: first.customer, tin: first.tin, address: first.address, terms: first.terms, bankAccount: first.bankAccount }
+    : { date: todayMDY(), siNo: "", customer: "", tin: "", address: "", terms: "Cash", bankAccount: "Cash on Hand" });
+  const [lines, setLines] = useState(editing
+    ? initialRows.map((r) => ({ id: r.id, desc: r.desc, vatable: r.vatable, exempt: r.exempt, zeroRated: r.zeroRated, coaCode: r.coaCode }))
+    : [mkSalesLine()]);
+  const setHeader = (k, val) => setH((p) => ({ ...p, [k]: val }));
+  const updateLine = (id, patch) => setLines((ls) => ls.map((l) => l.id === id ? { ...l, ...patch } : l));
+  const addLine = () => setLines((ls) => [...ls, mkSalesLine()]);
+  const removeLine = (id) => setLines((ls) => ls.length > 1 ? ls.filter((l) => l.id !== id) : ls);
   const acctOptions = data.coa.filter((a) => a.type === "Revenue").map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const custOptions = data.customers.map((c) => c.name).filter(Boolean);
   const [quickAdd, setQuickAdd] = useState(null); // typed name string, or null
   const onCustomer = (name) => {
     const c = data.customers.find((x) => x.name.toLowerCase() === (name || "").toLowerCase());
-    setV((p) => ({ ...p, customer: name, ...(c ? { tin: c.tin, address: c.address } : {}) }));
+    setH((p) => ({ ...p, customer: name, ...(c ? { tin: c.tin, address: c.address } : {}) }));
   };
   const onQuickAddSubmit = (customer) => {
     setData((d) => ({ ...d, customers: [...d.customers, customer].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })) }));
-    setV((p) => ({ ...p, customer: customer.name, tin: customer.tin, address: customer.address }));
+    setH((p) => ({ ...p, customer: customer.name, tin: customer.tin, address: customer.address }));
     setQuickAdd(null);
   };
-  const computed = computeSalesRow(v);
+  const computedLines = lines.map((l) => computeSalesRow(l));
+  const totals = computedLines.reduce((a, c) => ({ outputVat: a.outputVat + num(c.outputVat), total: a.total + num(c.total) }), { outputVat: 0, total: 0 });
+  const handleSubmit = () => onSubmit(expandEntryLines(lines, initialRows, (l, i, n) => computeSalesRow({
+    date: h.date, siNo: lineRef(h.siNo, i, n), customer: h.customer, tin: h.tin, address: h.address, terms: h.terms, bankAccount: h.bankAccount,
+    desc: l.desc, vatable: num(l.vatable), exempt: num(l.exempt), zeroRated: num(l.zeroRated), coaCode: l.coaCode,
+  })));
   return (
-    <EntryModalShell title="Add Sale" submitLabel="Add sale" onCancel={onCancel}
-      onSubmit={() => onSubmit(computeSalesRow({ id: uid(), ...v }))}>
-      <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
-      <LabeledField label="SI/OR No."><Field value={v.siNo} onChange={(x) => set("siNo", x)} placeholder="SI-0001" /></LabeledField>
-      <LabeledField label="Customer Name"><Field type="combo" options={custOptions} value={v.customer} onChange={onCustomer}
+    <EntryModalShell title={editing ? "Edit Sale" : "Add Sale"} submitLabel={entrySubmitLabel(editing, lines.length, "sale")} onCancel={onCancel} onSubmit={handleSubmit}>
+      <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
+      <LabeledField label="SI/OR No."><Field value={h.siNo} onChange={(x) => setHeader("siNo", x)} placeholder="SI-0001" /></LabeledField>
+      <LabeledField label="Customer Name"><Field type="combo" options={custOptions} value={h.customer} onChange={onCustomer}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="customer" /></LabeledField>
-      <LabeledField label="TIN"><Field value={v.tin} onChange={(x) => set("tin", x)} /></LabeledField>
-      <LabeledField label="Address" wide><Field value={v.address} onChange={(x) => set("address", x)} /></LabeledField>
-      <LabeledField label="Description" wide><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
-      <LabeledField label="VATable Sales"><Field type="number" align="right" value={v.vatable} onChange={(x) => set("vatable", x)} /></LabeledField>
-      <LabeledField label="VAT-Exempt"><Field type="number" align="right" value={v.exempt} onChange={(x) => set("exempt", x)} /></LabeledField>
-      <LabeledField label="Zero-Rated"><Field type="number" align="right" value={v.zeroRated} onChange={(x) => set("zeroRated", x)} /></LabeledField>
-      <LabeledField label="Terms"><Field type="select" options={TERMS} value={v.terms} onChange={(x) => set("terms", x)} /></LabeledField>
-      <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
-      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} disabled={v.terms === "Credit"} /></LabeledField>
-      <ComputedPreview items={[["Output VAT", fmt(computed.outputVat)], ["Total", fmt(computed.total)]]} />
+      <LabeledField label="TIN"><Field value={h.tin} onChange={(x) => setHeader("tin", x)} /></LabeledField>
+      <LabeledField label="Address" wide><Field value={h.address} onChange={(x) => setHeader("address", x)} /></LabeledField>
+      <LabeledField label="Terms"><Field type="select" options={TERMS} value={h.terms} onChange={(x) => setHeader("terms", x)} /></LabeledField>
+      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={h.bankAccount} onChange={(x) => setHeader("bankAccount", x)} disabled={h.terms === "Credit"} /></LabeledField>
+      <div className="modal-lines">
+        <div className="ml-lines-label">Line items</div>
+        {lines.map((l, i) => (
+          <LinesCard key={l.id} index={i} count={lines.length} onRemove={() => removeLine(l.id)}
+            foot={`Output VAT ${fmt(computedLines[i].outputVat)} · Line total ${fmt(computedLines[i].total)}`}>
+            <LabeledField label="Description" wide><Field value={l.desc} onChange={(x) => updateLine(l.id, { desc: x })} /></LabeledField>
+            <LabeledField label="Account" wide><Field type="combo" options={acctOptions} value={l.coaCode} onChange={(x) => updateLine(l.id, { coaCode: x })} /></LabeledField>
+            <LabeledField label="VATable Sales"><Field type="number" align="right" value={l.vatable} onChange={(x) => updateLine(l.id, { vatable: x })} /></LabeledField>
+            <LabeledField label="VAT-Exempt"><Field type="number" align="right" value={l.exempt} onChange={(x) => updateLine(l.id, { exempt: x })} /></LabeledField>
+            <LabeledField label="Zero-Rated"><Field type="number" align="right" value={l.zeroRated} onChange={(x) => updateLine(l.id, { zeroRated: x })} /></LabeledField>
+          </LinesCard>
+        ))}
+        <AddRowBtn onClick={addLine}>Add another line</AddRowBtn>
+      </div>
+      <ComputedPreview items={[["Lines", String(lines.length)], ["Output VAT", fmt(totals.outputVat)], ["Total", fmt(totals.total)]]} />
       {quickAdd !== null && (
         <QuickAddPartyModal kind="customer" initialName={quickAdd} onCancel={() => setQuickAdd(null)} onSubmit={onQuickAddSubmit} />
       )}
@@ -2901,9 +2977,15 @@ function SalesEntryModal({ data, setData, onCancel, onSubmit }) {
 // shape as a single manual entry), so every downstream computation, export and report is unchanged.
 const mkPurchaseLine = () => ({ id: uid(), itemCode: "", desc: "", vatType: "", atc: "", atcRate: 0, vatable: 0, nonvat: 0, coaCode: "5001" });
 
-function PurchaseEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [h, setH] = useState({ date: todayMDY(), invNo: "", supplier: "", tin: "", address: "", terms: "Cash", bankAccount: "Cash on Hand" });
-  const [lines, setLines] = useState([mkPurchaseLine()]);
+function PurchaseEntryModal({ data, setData, initialRows, onCancel, onSubmit }) {
+  const editing = !!(initialRows && initialRows.length);
+  const first = editing ? initialRows[0] : null;
+  const [h, setH] = useState(first
+    ? { date: first.date, invNo: stripLineRefSuffix(first.invNo), supplier: first.supplier, tin: first.tin, address: first.address, terms: first.terms, bankAccount: first.bankAccount }
+    : { date: todayMDY(), invNo: "", supplier: "", tin: "", address: "", terms: "Cash", bankAccount: "Cash on Hand" });
+  const [lines, setLines] = useState(editing
+    ? initialRows.map((r) => ({ id: r.id, itemCode: r.itemCode, desc: r.desc, vatType: r.vatType, atc: r.atc, atcRate: r.atcRate, vatable: r.vatable, nonvat: r.nonvat, coaCode: r.coaCode }))
+    : [mkPurchaseLine()]);
   const setHeader = (k, val) => setH((p) => ({ ...p, [k]: val }));
   const updateLine = (id, patch) => setLines((ls) => ls.map((l) => l.id === id ? { ...l, ...patch } : l));
   const addLine = () => setLines((ls) => [...ls, mkPurchaseLine()]);
@@ -2946,20 +3028,15 @@ function PurchaseEntryModal({ data, setData, onCancel, onSubmit }) {
     total: a.total + num(c.total), ewt: a.ewt + num(c.ewt), net: a.net + num(c.net),
   }), { vatable: 0, nonvat: 0, inputVat: 0, total: 0, ewt: 0, net: 0 });
 
-  const handleSubmit = () => {
-    const n = lines.length;
-    const rows = lines.map((l, i) => computePurchaseRow({
-      id: uid(), date: h.date,
-      invNo: n > 1 ? `${h.invNo}${h.invNo ? " " : ""}(${i + 1}/${n})` : h.invNo,
-      supplier: h.supplier, tin: h.tin, address: h.address, terms: h.terms, bankAccount: h.bankAccount,
-      itemCode: l.itemCode, desc: l.desc, vatType: l.vatType, atc: l.atc, atcRate: num(l.atcRate),
-      vatable: num(l.vatable), nonvat: num(l.nonvat), coaCode: l.coaCode,
-    }));
-    onSubmit(rows);
-  };
+  const handleSubmit = () => onSubmit(expandEntryLines(lines, initialRows, (l, i, n) => computePurchaseRow({
+    date: h.date, invNo: lineRef(h.invNo, i, n),
+    supplier: h.supplier, tin: h.tin, address: h.address, terms: h.terms, bankAccount: h.bankAccount,
+    itemCode: l.itemCode, desc: l.desc, vatType: l.vatType, atc: l.atc, atcRate: num(l.atcRate),
+    vatable: num(l.vatable), nonvat: num(l.nonvat), coaCode: l.coaCode,
+  })));
 
   return (
-    <EntryModalShell title="Add Purchase" submitLabel={lines.length > 1 ? `Add ${lines.length} lines` : "Add purchase"} onCancel={onCancel} onSubmit={handleSubmit}>
+    <EntryModalShell title={editing ? "Edit Purchase" : "Add Purchase"} submitLabel={entrySubmitLabel(editing, lines.length, "purchase")} onCancel={onCancel} onSubmit={handleSubmit}>
       <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
       <LabeledField label="Supplier Inv./OR"><Field value={h.invNo} onChange={(x) => setHeader("invNo", x)} /></LabeledField>
       <LabeledField label="Supplier Name"><Field type="combo" options={suppOptions} value={h.supplier} onChange={applySupplier}
@@ -3010,9 +3087,15 @@ function PurchaseEntryModal({ data, setData, onCancel, onSubmit }) {
 
 const mkDisbLine = () => ({ id: uid(), desc: "", atc: "", atcRate: 0, amount: 0, coaCode: "6170", appliedToPurchaseId: "" });
 
-function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [h, setH] = useState({ date: todayMDY(), tin: "", vendor: "", cvNo: "", bankAccount: "Cash on Hand" });
-  const [lines, setLines] = useState([mkDisbLine()]);
+function DisbEntryModal({ data, setData, initialRows, onCancel, onSubmit }) {
+  const editing = !!(initialRows && initialRows.length);
+  const first = editing ? initialRows[0] : null;
+  const [h, setH] = useState(first
+    ? { date: first.date, tin: first.tin, vendor: first.vendor, cvNo: stripLineRefSuffix(first.cvNo), bankAccount: first.bankAccount }
+    : { date: todayMDY(), tin: "", vendor: "", cvNo: "", bankAccount: "Cash on Hand" });
+  const [lines, setLines] = useState(editing
+    ? initialRows.map((r) => ({ id: r.id, desc: r.desc, atc: r.atc, atcRate: r.atcRate, amount: r.amount, coaCode: r.coaCode, appliedToPurchaseId: r.appliedToPurchaseId || "" }))
+    : [mkDisbLine()]);
   const setHeader = (k, val) => setH((p) => ({ ...p, [k]: val }));
   const updateLine = (id, patch) => setLines((ls) => ls.map((l) => l.id === id ? { ...l, ...patch } : l));
   const addLine = () => setLines((ls) => [...ls, mkDisbLine()]);
@@ -3042,19 +3125,14 @@ function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
   const computedLines = lines.map((l) => computeDisbRow(l));
   const totals = computedLines.reduce((a, c) => ({ amount: a.amount + num(c.amount), ewt: a.ewt + num(c.ewt), net: a.net + num(c.net) }), { amount: 0, ewt: 0, net: 0 });
 
-  const handleSubmit = () => {
-    const n = lines.length;
-    const rows = lines.map((l, i) => computeDisbRow({
-      id: uid(), date: h.date, tin: h.tin, vendor: h.vendor, bankAccount: h.bankAccount,
-      cvNo: n > 1 ? `${h.cvNo}${h.cvNo ? " " : ""}(${i + 1}/${n})` : h.cvNo,
-      desc: l.desc, atc: l.atc, atcRate: num(l.atcRate), amount: num(l.amount), coaCode: l.coaCode,
-      appliedToPurchaseId: l.appliedToPurchaseId || "",
-    }));
-    onSubmit(rows);
-  };
+  const handleSubmit = () => onSubmit(expandEntryLines(lines, initialRows, (l, i, n) => computeDisbRow({
+    date: h.date, tin: h.tin, vendor: h.vendor, bankAccount: h.bankAccount, cvNo: lineRef(h.cvNo, i, n),
+    desc: l.desc, atc: l.atc, atcRate: num(l.atcRate), amount: num(l.amount), coaCode: l.coaCode,
+    appliedToPurchaseId: l.appliedToPurchaseId || "",
+  })));
 
   return (
-    <EntryModalShell title="Add Disbursement" submitLabel={lines.length > 1 ? `Add ${lines.length} lines` : "Add disbursement"} onCancel={onCancel} onSubmit={handleSubmit}>
+    <EntryModalShell title={editing ? "Edit Disbursement" : "Add Disbursement"} submitLabel={entrySubmitLabel(editing, lines.length, "disbursement")} onCancel={onCancel} onSubmit={handleSubmit}>
       <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
       <LabeledField label="TIN"><Field value={h.tin} onChange={(x) => setHeader("tin", x)} /></LabeledField>
       <LabeledField label="Suppliers Name"><Field type="combo" options={suppOptions} value={h.vendor} onChange={applySupplier}
@@ -3078,7 +3156,7 @@ function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
                 <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={l.atc} onChange={(x) => onLineAtc(l.id, x)} /></LabeledField>
                 <LabeledField label="Rate"><ReadCell align="center">{l.atc ? `${round2(num(l.atcRate) * 100)}%` : "—"}</ReadCell></LabeledField>
                 <LabeledField label="Amount"><Field type="number" align="right" value={l.amount} onChange={(x) => updateLine(l.id, { amount: x })} /></LabeledField>
-                {invoiceOptions.length > 1 && (
+                {(invoiceOptions.length > 1 || l.appliedToPurchaseId) && (
                   <LabeledField label="Applied to Invoice" wide><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AP, data, h.vendor, l.appliedToPurchaseId)} value={l.appliedToPurchaseId} onChange={(x) => updateLine(l.id, { appliedToPurchaseId: x })} /></LabeledField>
                 )}
               </div>
@@ -3097,46 +3175,75 @@ function DisbEntryModal({ data, setData, onCancel, onSubmit }) {
   );
 }
 
-function ReceiptEntryModal({ data, setData, onCancel, onSubmit }) {
-  const [v, setV] = useState({ date: todayMDY(), from: "", orNo: "", desc: "", atc: "", atcRate: 0, amount: 0, cwt: 0, bankAccount: "Cash on Hand", coaCode: "1200", appliedToSalesId: "" });
-  const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
+const mkReceiptLine = () => ({ id: uid(), desc: "", atc: "", atcRate: 0, amount: 0, cwt: 0, coaCode: "1200", appliedToSalesId: "" });
+
+function ReceiptEntryModal({ data, setData, initialRows, onCancel, onSubmit }) {
+  const editing = !!(initialRows && initialRows.length);
+  const first = editing ? initialRows[0] : null;
+  const [h, setH] = useState(first
+    ? { date: first.date, from: first.from, orNo: stripLineRefSuffix(first.orNo), bankAccount: first.bankAccount }
+    : { date: todayMDY(), from: "", orNo: "", bankAccount: "Cash on Hand" });
+  const [lines, setLines] = useState(editing
+    ? initialRows.map((r) => ({ id: r.id, desc: r.desc, atc: r.atc, atcRate: r.atcRate, amount: r.amount, cwt: r.cwt, coaCode: r.coaCode, appliedToSalesId: r.appliedToSalesId || "" }))
+    : [mkReceiptLine()]);
+  const setHeader = (k, val) => setH((p) => ({ ...p, [k]: val }));
+  const updateLine = (id, patch) => setLines((ls) => ls.map((l) => l.id === id ? { ...l, ...patch } : l));
+  const addLine = () => setLines((ls) => [...ls, mkReceiptLine()]);
+  const removeLine = (id) => setLines((ls) => ls.length > 1 ? ls.filter((l) => l.id !== id) : ls);
   const acctOptions = data.coa.map((a) => ({ value: a.code, label: `${a.code} · ${a.name}` }));
   const custOptions = data.customers.map((c) => c.name).filter(Boolean);
-  const invoiceOptions = useMemo(() => openInvoiceOptions(AGING_SIDES.AR, data, v.from), [data, v.from]);
+  const invoiceOptions = useMemo(() => openInvoiceOptions(AGING_SIDES.AR, data, h.from), [data, h.from]);
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
   const [quickAdd, setQuickAdd] = useState(null);
+  const onFrom = (name) => {
+    setH((p) => ({ ...p, from: name }));
+    setLines((ls) => ls.map((l) => ({ ...l, appliedToSalesId: "" })));
+  };
   const onQuickAddSubmit = (customer) => {
     setData((d) => ({ ...d, customers: [...d.customers, customer].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })) }));
-    setV((p) => ({ ...p, from: customer.name }));
+    onFrom(customer.name);
     setQuickAdd(null);
   };
-  const onAtc = (code) => {
+  const onLineAtc = (id, code) => {
     const atc = data.atc.find((a) => a.code === code);
     const rate = atc ? num(atc.rate) : 0;
-    setV((p) => ({ ...p, atc: code, atcRate: rate, cwt: round2(cwtTaxBase(data, p.amount) * rate) }));
+    setLines((ls) => ls.map((l) => l.id === id ? { ...l, atc: code, atcRate: rate, cwt: round2(cwtTaxBase(data, l.amount) * rate) } : l));
   };
-  const onAmount = (val) => {
-    setV((p) => ({ ...p, amount: val, cwt: p.atc ? round2(cwtTaxBase(data, val) * num(p.atcRate)) : p.cwt }));
+  const onLineAmount = (id, val) => {
+    setLines((ls) => ls.map((l) => l.id === id ? { ...l, amount: val, cwt: l.atc ? round2(cwtTaxBase(data, val) * num(l.atcRate)) : l.cwt } : l));
   };
-  const computed = computeReceiptRow(v);
+  const computedLines = lines.map((l) => computeReceiptRow(l));
+  const totals = computedLines.reduce((a, c) => ({ amount: a.amount + num(c.amount), cwt: a.cwt + num(c.cwt), net: a.net + num(c.net) }), { amount: 0, cwt: 0, net: 0 });
+  const handleSubmit = () => onSubmit(expandEntryLines(lines, initialRows, (l, i, n) => computeReceiptRow({
+    date: h.date, from: h.from, orNo: lineRef(h.orNo, i, n), bankAccount: h.bankAccount,
+    desc: l.desc, atc: l.atc, atcRate: num(l.atcRate), amount: num(l.amount), cwt: num(l.cwt), coaCode: l.coaCode,
+    appliedToSalesId: l.appliedToSalesId || "",
+  })));
   return (
-    <EntryModalShell title="Add Receipt" submitLabel="Add receipt" onCancel={onCancel}
-      onSubmit={() => onSubmit(computeReceiptRow({ id: uid(), ...v }))}>
-      <LabeledField label="Date"><Field type="date" value={v.date} onChange={(x) => set("date", x)} /></LabeledField>
-      <LabeledField label="Received From"><Field type="combo" options={custOptions} value={v.from} onChange={(x) => setV((p) => ({ ...p, from: x, appliedToSalesId: "" }))}
+    <EntryModalShell title={editing ? "Edit Receipt" : "Add Receipt"} submitLabel={entrySubmitLabel(editing, lines.length, "receipt")} onCancel={onCancel} onSubmit={handleSubmit}>
+      <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
+      <LabeledField label="Received From"><Field type="combo" options={custOptions} value={h.from} onChange={onFrom}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="customer" /></LabeledField>
-      <LabeledField label="OR/Ref No."><Field value={v.orNo} onChange={(x) => set("orNo", x)} placeholder="OR-001" /></LabeledField>
-      <LabeledField label="Description" wide><Field value={v.desc} onChange={(x) => set("desc", x)} /></LabeledField>
-      <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={v.atc} onChange={onAtc} /></LabeledField>
-      <LabeledField label="Rate"><ReadCell align="center">{v.atc ? `${round2(v.atcRate * 100)}%` : "—"}</ReadCell></LabeledField>
-      <LabeledField label="Amount"><Field type="number" align="right" value={v.amount} onChange={onAmount} /></LabeledField>
-      <LabeledField label="CWT"><Field type="number" align="right" value={v.cwt} onChange={(x) => set("cwt", x)} /></LabeledField>
-      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={v.bankAccount} onChange={(x) => set("bankAccount", x)} /></LabeledField>
-      <LabeledField label="Account"><Field type="combo" options={acctOptions} value={v.coaCode} onChange={(x) => set("coaCode", x)} /></LabeledField>
-      {invoiceOptions.length > 1 && (
-        <LabeledField label="Applied to Invoice" wide><Field type="combo" options={invoiceOptions} value={v.appliedToSalesId} onChange={(x) => set("appliedToSalesId", x)} /></LabeledField>
-      )}
-      <ComputedPreview items={[["Net Amount", fmt(computed.net)]]} />
+      <LabeledField label="OR/Ref No."><Field value={h.orNo} onChange={(x) => setHeader("orNo", x)} placeholder="OR-001" /></LabeledField>
+      <LabeledField label="Bank Account"><Field type="select" options={BANK_ACCOUNTS} value={h.bankAccount} onChange={(x) => setHeader("bankAccount", x)} /></LabeledField>
+      <div className="modal-lines">
+        <div className="ml-lines-label">Line items</div>
+        {lines.map((l, i) => (
+          <LinesCard key={l.id} index={i} count={lines.length} onRemove={() => removeLine(l.id)} foot={`Net ${fmt(computedLines[i].net)}`}>
+            <LabeledField label="Description" wide><Field value={l.desc} onChange={(x) => updateLine(l.id, { desc: x })} /></LabeledField>
+            <LabeledField label="Account" wide><Field type="combo" options={acctOptions} value={l.coaCode} onChange={(x) => updateLine(l.id, { coaCode: x })} /></LabeledField>
+            <LabeledField label="ATC"><Field type="combo" options={atcOptions} value={l.atc} onChange={(x) => onLineAtc(l.id, x)} /></LabeledField>
+            <LabeledField label="Rate"><ReadCell align="center">{l.atc ? `${round2(num(l.atcRate) * 100)}%` : "—"}</ReadCell></LabeledField>
+            <LabeledField label="Amount"><Field type="number" align="right" value={l.amount} onChange={(x) => onLineAmount(l.id, x)} /></LabeledField>
+            <LabeledField label="CWT"><Field type="number" align="right" value={l.cwt} onChange={(x) => updateLine(l.id, { cwt: x })} /></LabeledField>
+            {(invoiceOptions.length > 1 || l.appliedToSalesId) && (
+              <LabeledField label="Applied to Invoice" wide><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AR, data, h.from, l.appliedToSalesId)} value={l.appliedToSalesId} onChange={(x) => updateLine(l.id, { appliedToSalesId: x })} /></LabeledField>
+            )}
+          </LinesCard>
+        ))}
+        <AddRowBtn onClick={addLine}>Add another line</AddRowBtn>
+      </div>
+      <ComputedPreview items={[["Lines", String(lines.length)], ["Amount", fmt(totals.amount)], ["CWT", fmt(totals.cwt)], ["Net Amount", fmt(totals.net)]]} />
       <div className="qf-hint">CWT auto-fills from ATC × Amount, but stays fully editable — type over it (formulas work too) for non-VAT books or special cases.</div>
       {quickAdd !== null && (
         <QuickAddPartyModal kind="customer" initialName={quickAdd} onCancel={() => setQuickAdd(null)} onSubmit={onQuickAddSubmit} />
@@ -3482,6 +3589,7 @@ function SalesPage({ data, setData }) {
   const custOptions = data.customers.map((c) => c.name).filter(Boolean);
   const importHook = useJournalImport("sales", data, ({ newRows }) => setData((d) => ({ ...d, sales: [...d.sales, ...newRows] })));
   const [modalOpen, setModalOpen] = useState(false);
+  const [editRows, setEditRows] = useState(null); // rows of the entry open in the edit form, or null
   const [quickAddCustomer, setQuickAddCustomer] = useState(null); // { rowId } | null
   const [filter, setFilter] = usePeriodFilter();
   const [search, setSearch] = useState("");
@@ -3573,7 +3681,7 @@ function SalesPage({ data, setData }) {
                   <td><Field type="select" options={TERMS} value={r.terms} onChange={(v) => update(r.id, { terms: v })} /></td>
                   <td><Field type="combo" options={acctOptions} value={r.coaCode} onChange={(v) => update(r.id, { coaCode: v })} /></td>
                   <td><Field type="select" options={BANK_ACCOUNTS} value={r.bankAccount} onChange={(v) => update(r.id, { bankAccount: v })} disabled={r.terms === "Credit"} /></td>
-                  <td className="text-center"><DelBtn onClick={() => onDelete(r.id)} /></td>
+                  <td className="text-center"><span className="row-actions"><EditBtn onClick={() => setEditRows(findEntryGroup(data.sales, r, "siNo", "customer"))} /><DelBtn onClick={() => onDelete(r.id)} /></span></td>
                 </tr>
               ))}
             </tbody>
@@ -3591,7 +3699,11 @@ function SalesPage({ data, setData }) {
       </div>
       {modalOpen && (
         <SalesEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
-          onSubmit={(row) => { setData((d) => ({ ...d, sales: [...d.sales, row] })); setModalOpen(false); }} />
+          onSubmit={(rows) => { setData((d) => ({ ...d, sales: [...d.sales, ...rows] })); setModalOpen(false); }} />
+      )}
+      {editRows && (
+        <SalesEntryModal data={data} setData={setData} initialRows={editRows} onCancel={() => setEditRows(null)}
+          onSubmit={(rows) => { setData((d) => ({ ...d, sales: replaceEntryRows(d.sales, editRows.map((r) => r.id), rows) })); setEditRows(null); }} />
       )}
       {quickAddCustomer && (
         <QuickAddPartyModal kind="customer" initialName={quickAddCustomer.typedName}
@@ -3617,6 +3729,7 @@ function PurchasesPage({ data, setData }) {
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
   const importHook = useJournalImport("purchases", data, ({ newRows }) => setData((d) => ({ ...d, purchases: [...d.purchases, ...newRows] })));
   const [modalOpen, setModalOpen] = useState(false);
+  const [editRows, setEditRows] = useState(null); // rows of the entry open in the edit form, or null
   const [quickFixOpen, setQuickFixOpen] = useState(false);
   const [quickAddSupplier, setQuickAddSupplier] = useState(null); // { rowId, typedName } | null
   const [filter, setFilter] = usePeriodFilter();
@@ -3732,7 +3845,7 @@ function PurchasesPage({ data, setData }) {
                   <td><Field type="select" options={TERMS} value={r.terms} onChange={(v) => update(r.id, { terms: v })} /></td>
                   <td><Field type="combo" options={acctOptions} value={r.coaCode} onChange={(v) => update(r.id, { coaCode: v })} /></td>
                   <td><Field type="select" options={BANK_ACCOUNTS} value={r.bankAccount} onChange={(v) => update(r.id, { bankAccount: v })} disabled={r.terms === "Credit"} /></td>
-                  <td className="text-center"><DelBtn onClick={() => onDelete(r.id)} /></td>
+                  <td className="text-center"><span className="row-actions"><EditBtn onClick={() => setEditRows(findEntryGroup(data.purchases, r, "invNo", "supplier"))} /><DelBtn onClick={() => onDelete(r.id)} /></span></td>
                 </tr>
               ))}
             </tbody>
@@ -3751,6 +3864,10 @@ function PurchasesPage({ data, setData }) {
       {modalOpen && (
         <PurchaseEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
           onSubmit={(rows) => { setData((d) => ({ ...d, purchases: [...d.purchases, ...rows] })); setModalOpen(false); }} />
+      )}
+      {editRows && (
+        <PurchaseEntryModal data={data} setData={setData} initialRows={editRows} onCancel={() => setEditRows(null)}
+          onSubmit={(rows) => { setData((d) => ({ ...d, purchases: replaceEntryRows(d.purchases, editRows.map((r) => r.id), rows) })); setEditRows(null); }} />
       )}
       {quickAddSupplier && (
         <QuickAddPartyModal kind="supplier" initialName={quickAddSupplier.typedName}
@@ -3777,6 +3894,7 @@ function DisbursementsPage({ data, setData }) {
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
   const importHook = useJournalImport("disbursements", data, ({ newRows }) => setData((d) => ({ ...d, disbursements: [...d.disbursements, ...newRows] })));
   const [modalOpen, setModalOpen] = useState(false);
+  const [editRows, setEditRows] = useState(null); // rows of the entry open in the edit form, or null
   const [quickAddSupplier, setQuickAddSupplier] = useState(null); // { rowId, typedName } | null
   const [filter, setFilter] = usePeriodFilter();
   const [search, setSearch] = useState("");
@@ -3867,7 +3985,10 @@ function DisbursementsPage({ data, setData }) {
                   <td><Field type="select" options={BANK_ACCOUNTS} value={r.bankAccount} onChange={(v) => update(r.id, { bankAccount: v })} /></td>
                   <td><Field type="combo" options={acctOptions} value={r.coaCode} onChange={(v) => update(r.id, { coaCode: v })} /></td>
                   <td><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AP, data, r.vendor, r.appliedToPurchaseId)} value={r.appliedToPurchaseId || ""} onChange={(v) => update(r.id, { appliedToPurchaseId: v })} /></td>
-                  <td className="text-center"><DelBtn onClick={() => onDelete(r.id)} /></td>
+                  <td className="text-center"><span className="row-actions">
+                    <EditBtn disabled={!!r.pettyCashId} title={r.pettyCashId ? "Posted from the Petty Cash Journal — edit it there" : undefined}
+                      onClick={() => setEditRows(findEntryGroup(data.disbursements, r, "cvNo", "vendor"))} />
+                    <DelBtn onClick={() => onDelete(r.id)} /></span></td>
                 </tr>
               ))}
             </tbody>
@@ -3883,6 +4004,10 @@ function DisbursementsPage({ data, setData }) {
       {modalOpen && (
         <DisbEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
           onSubmit={(rows) => { setData((d) => ({ ...d, disbursements: [...d.disbursements, ...rows] })); setModalOpen(false); }} />
+      )}
+      {editRows && (
+        <DisbEntryModal data={data} setData={setData} initialRows={editRows} onCancel={() => setEditRows(null)}
+          onSubmit={(rows) => { setData((d) => ({ ...d, disbursements: replaceEntryRows(d.disbursements, editRows.map((r) => r.id), rows) })); setEditRows(null); }} />
       )}
       {quickAddSupplier && (
         <QuickAddPartyModal kind="supplier" initialName={quickAddSupplier.typedName}
@@ -4345,6 +4470,7 @@ function ReceiptsPage({ data, setData }) {
   const atcOptions = data.atc.map((a) => ({ value: a.code, label: `${a.code} — ${a.desc} (${round2(num(a.rate) * 100)}%)` }));
   const importHook = useJournalImport("receipts", data, ({ newRows }) => setData((d) => ({ ...d, receipts: [...d.receipts, ...newRows] })));
   const [modalOpen, setModalOpen] = useState(false);
+  const [editRows, setEditRows] = useState(null); // rows of the entry open in the edit form, or null
   const [quickAddCustomer, setQuickAddCustomer] = useState(null); // { rowId, typedName } | null
   const [filter, setFilter] = usePeriodFilter();
   const [search, setSearch] = useState("");
@@ -4432,7 +4558,7 @@ function ReceiptsPage({ data, setData }) {
                   <td><Field type="select" options={BANK_ACCOUNTS} value={r.bankAccount} onChange={(v) => update(r.id, { bankAccount: v })} /></td>
                   <td><Field type="combo" options={acctOptions} value={r.coaCode} onChange={(v) => update(r.id, { coaCode: v })} /></td>
                   <td><Field type="combo" options={openInvoiceOptions(AGING_SIDES.AR, data, r.from, r.appliedToSalesId)} value={r.appliedToSalesId || ""} onChange={(v) => update(r.id, { appliedToSalesId: v })} /></td>
-                  <td className="text-center"><DelBtn onClick={() => onDelete(r.id)} /></td>
+                  <td className="text-center"><span className="row-actions"><EditBtn onClick={() => setEditRows(findEntryGroup(data.receipts, r, "orNo", "from"))} /><DelBtn onClick={() => onDelete(r.id)} /></span></td>
                 </tr>
               ))}
             </tbody>
@@ -4447,7 +4573,11 @@ function ReceiptsPage({ data, setData }) {
       </div>
       {modalOpen && (
         <ReceiptEntryModal data={data} setData={setData} onCancel={() => setModalOpen(false)}
-          onSubmit={(row) => { setData((d) => ({ ...d, receipts: [...d.receipts, row] })); setModalOpen(false); }} />
+          onSubmit={(rows) => { setData((d) => ({ ...d, receipts: [...d.receipts, ...rows] })); setModalOpen(false); }} />
+      )}
+      {editRows && (
+        <ReceiptEntryModal data={data} setData={setData} initialRows={editRows} onCancel={() => setEditRows(null)}
+          onSubmit={(rows) => { setData((d) => ({ ...d, receipts: replaceEntryRows(d.receipts, editRows.map((r) => r.id), rows) })); setEditRows(null); }} />
       )}
       {quickAddCustomer && (
         <QuickAddPartyModal kind="customer" initialName={quickAddCustomer.typedName}
@@ -4473,6 +4603,7 @@ function GeneralJournalPage({ data, setData }) {
   const [search, setSearch] = useState("");
   const [previewVoucher, setPreviewVoucher] = useState(null);
   const [copySource, setCopySource] = useState(null);
+  const [editJv, setEditJv] = useState(null);
   const sel = useRowSelection();
 
   const updateJv = (id, patch) => setData((d) => ({ ...d, generalJournal: d.generalJournal.map((jv) => jv.id === id ? { ...jv, ...patch } : jv) }));
@@ -4573,6 +4704,7 @@ function GeneralJournalPage({ data, setData }) {
                   <Field type="date" value={jv.date} onChange={(v) => updateJv(jv.id, { date: v })} />
                   <Field value={jv.particulars} onChange={(v) => updateJv(jv.id, { particulars: v })} placeholder="Particulars / description of entry" />
                   <span className={"jv-status" + (balanced ? " ok" : "")}>{debitSum === 0 && creditSum === 0 ? "Empty" : balanced ? "Balanced" : "Out of balance"}</span>
+                  <EditBtn onClick={() => setEditJv(jv)} title="Edit in form" />
                   <button className="del-btn" onClick={() => deleteJv(jv.id)}><Trash2 size={14} /></button>
                 </div>
                 <div className="table-toolbar">
@@ -4612,6 +4744,11 @@ function GeneralJournalPage({ data, setData }) {
           initial={{ date: todayMDY(), particulars: copySource.particulars, lines: copySource.lines }}
           title={`Copy of ${copySource.jvNo || "Journal Entry"}`} submitLabel="Post"
           onCancel={() => setCopySource(null)} onSubmit={onPostCopy} />
+      )}
+      {editJv && (
+        <JournalVoucherModal data={data} initial={editJv} title={`Edit ${editJv.jvNo || "Journal Voucher"}`} submitLabel="Save changes"
+          onCancel={() => setEditJv(null)}
+          onSubmit={(jv) => { setData((d) => ({ ...d, generalJournal: d.generalJournal.map((x) => x.id === editJv.id ? { ...x, ...jv, id: x.id } : x) })); setEditJv(null); }} />
       )}
       {confirmDeleteOpen && (
         <ConfirmModal title="Delete selected" danger confirmLabel="Delete"
@@ -9333,6 +9470,10 @@ function Style() {
       .add-row-btn:hover { background: var(--paper-deep); border-color: var(--green); }
       .del-btn { background: none; border: none; color: #B9877E; cursor: pointer; padding: 4px; border-radius: 5px; display: inline-flex; }
       .del-btn:hover { background: #FBEAE7; color: var(--red); }
+      .edit-btn { background: none; border: none; color: var(--ink-soft); cursor: pointer; padding: 4px; border-radius: 5px; display: inline-flex; }
+      .edit-btn:hover:not(:disabled) { background: var(--paper-deep); color: var(--ink); }
+      .edit-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+      .row-actions { display: inline-flex; gap: 2px; align-items: center; }
 
       .year-select, .period-picker select { border: 1px solid var(--line); background: var(--white); border-radius: 6px; padding: 7px 10px; font-size: 12.5px; color: var(--ink); font-family: inherit; }
       .period-picker { display: flex; gap: 8px; }
