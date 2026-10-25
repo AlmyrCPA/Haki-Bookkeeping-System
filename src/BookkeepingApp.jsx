@@ -661,6 +661,23 @@ const JOURNAL_SHEETS = {
 // sheet by elimination. Includes the reference/context tabs and the dropdown "Lists" tab.
 const REFERENCE_SHEET_NAMES = ["Instructions", "Chart of Accounts", "Item Record", "Customers Master", "Suppliers Master", "ATC Reference", "VAT Type", "Lists"];
 
+// Template account columns show "code - name" so the user can tell accounts apart in the dropdown;
+// on import only the code is kept.
+const TEMPLATE_ACCOUNT_FIELDS = new Set(["coaCode", "account", "assetAccount", "accumDepAccount", "depExpenseAccount"]);
+const coaTemplateLabel = (a) => `${a.code} - ${a.name}`;
+
+function coaCodeLabel(coa, code) {
+  const a = (coa || []).find((x) => x.code === code);
+  return a ? coaTemplateLabel(a) : (code || "");
+}
+
+function parseTemplateAccount(coa, value) {
+  const v = String(value ?? "").trim();
+  if (!v || (coa || []).some((a) => a.code === v)) return v;
+  const m = v.match(/^(\S+)\s+-\s+/);
+  return m && (coa || []).some((a) => a.code === m[1]) ? m[1] : v;
+}
+
 function buildEntryAOA(journalKey, data) {
   const meta = JOURNAL_SHEETS[journalKey];
   const header = meta.cols.map((c) => c.header);
@@ -668,12 +685,12 @@ function buildEntryAOA(journalKey, data) {
   if (journalKey === "generaljournal") {
     (data.generalJournal || []).forEach((jv) => {
       (jv.lines || []).forEach((l) => {
-        rows.push([jv.jvNo || "", jv.date || "", jv.particulars || "", l.account || "", l.debit || "", l.credit || ""]);
+        rows.push([jv.jvNo || "", jv.date || "", jv.particulars || "", coaCodeLabel(data.coa, l.account), l.debit || "", l.credit || ""]);
       });
     });
   } else {
     (data[meta.dataKey] || []).forEach((r) => {
-      rows.push(meta.cols.map((c) => r[c.field] ?? ""));
+      rows.push(meta.cols.map((c) => TEMPLATE_ACCOUNT_FIELDS.has(c.field) ? coaCodeLabel(data.coa, r[c.field]) : (r[c.field] ?? "")));
     });
   }
   return [header, ...rows];
@@ -707,13 +724,13 @@ const TEMPLATE_FIXED_LISTS = {
 
 // field -> dropdown source. { list: "<key in TEMPLATE_FIXED_LISTS>" } | { sheet, col }
 const JOURNAL_TEMPLATE_DROPDOWNS = {
-  sales: { customer: { sheet: "Customers Master", col: "B" }, terms: { list: "Terms" }, coaCode: { sheet: "Chart of Accounts", col: "A" }, bankAccount: { list: "Bank Account" } },
-  purchases: { supplier: { sheet: "Suppliers Master", col: "B" }, itemCode: { sheet: "Item Record", col: "A" }, vatType: { sheet: "VAT Type", col: "A" }, atc: { sheet: "ATC Reference", col: "A" }, terms: { list: "Terms" }, coaCode: { sheet: "Chart of Accounts", col: "A" }, bankAccount: { list: "Bank Account" } },
-  disbursements: { vendor: { sheet: "Suppliers Master", col: "B" }, atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
-  receipts: { atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
-  generaljournal: { account: { sheet: "Chart of Accounts", col: "A" } },
-  pettycash: { bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "A" } },
-  fixedassets: { assetAccount: { sheet: "Chart of Accounts", col: "A" }, accumDepAccount: { sheet: "Chart of Accounts", col: "A" }, depExpenseAccount: { sheet: "Chart of Accounts", col: "A" }, status: { list: "Asset Status" } },
+  sales: { customer: { sheet: "Customers Master", col: "B" }, terms: { list: "Terms" }, coaCode: { sheet: "Chart of Accounts", col: "D" }, bankAccount: { list: "Bank Account" } },
+  purchases: { supplier: { sheet: "Suppliers Master", col: "B" }, itemCode: { sheet: "Item Record", col: "A" }, vatType: { sheet: "VAT Type", col: "A" }, atc: { sheet: "ATC Reference", col: "A" }, terms: { list: "Terms" }, coaCode: { sheet: "Chart of Accounts", col: "D" }, bankAccount: { list: "Bank Account" } },
+  disbursements: { vendor: { sheet: "Suppliers Master", col: "B" }, atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "D" } },
+  receipts: { atc: { sheet: "ATC Reference", col: "A" }, bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "D" } },
+  generaljournal: { account: { sheet: "Chart of Accounts", col: "D" } },
+  pettycash: { bankAccount: { list: "Bank Account" }, coaCode: { sheet: "Chart of Accounts", col: "D" } },
+  fixedassets: { assetAccount: { sheet: "Chart of Accounts", col: "D" }, accumDepAccount: { sheet: "Chart of Accounts", col: "D" }, depExpenseAccount: { sheet: "Chart of Accounts", col: "D" }, status: { list: "Asset Status" } },
   form2307: { atc: { sheet: "ATC Reference", col: "A" } },
   employees: { isMWE: { list: "Yes / No" }, substitutedFiling: { list: "Yes / No" }, empStatus: { list: "Employment Status" }, prevEmpStatus: { list: "Employment Status" } },
 };
@@ -748,7 +765,7 @@ function addTemplateRefSheets(wb, data) {
     header.forEach((_, i) => { ws.getColumn(i + 1).width = 26; });
     sheets[name] = rows.length;
   };
-  add("Chart of Accounts", ["Code", "Account Name", "Class"], (data.coa || []).map((a) => [a.code, a.name, a.type]));
+  add("Chart of Accounts", ["Code", "Account Name", "Class", "Code - Account Name"], (data.coa || []).map((a) => [a.code, a.name, a.type, coaTemplateLabel(a)]));
   add("Item Record", ["Item", "Default Account Code", "Type"], (data.items || []).map((i) => [i.item, i.account, i.type]));
   add("Customers Master", ["TIN", "Customer Name", "Address"], (data.customers || []).map((c) => [c.tin, c.name, c.address]));
   add("Suppliers Master", ["TIN", "Supplier Name", "Address"], (data.suppliers || []).map((s) => [s.tin, s.name, s.address]));
@@ -839,7 +856,7 @@ async function downloadJournalTemplate(journalKey, data) {
   templateInstructionLines(journalKey).forEach((line) => instr.addRow([line]));
 
   const sheet = wb.addWorksheet(meta.title.slice(0, 31));
-  sheet.columns = meta.cols.map((c) => ({ header: c.header, key: c.field, width: Math.max(14, c.header.length + 2) }));
+  sheet.columns = meta.cols.map((c) => ({ header: c.header, key: c.field, width: TEMPLATE_ACCOUNT_FIELDS.has(c.field) ? 36 : Math.max(14, c.header.length + 2) }));
   sheet.getRow(1).font = { bold: true };
   const [, ...existing] = buildEntryAOA(journalKey, data); // drop the header row we already have
   existing.forEach((r) => sheet.addRow(r));
@@ -876,7 +893,7 @@ async function importJournalExcel(journalKey, file, data) {
       const key = String(jvNo ?? "").trim() || `JV-IMPORT-${uid()}`;
       if (!groups[key]) { groups[key] = { id: uid(), jvNo: key, date: toMDY(String(date ?? "").trim()), particulars: String(particulars ?? "").trim(), lines: [] }; order.push(key); }
       if (!String(account ?? "").trim() && !num(debit) && !num(credit)) return;
-      groups[key].lines.push({ id: uid(), account: String(account ?? "").trim(), debit: round2(num(debit)), credit: round2(num(credit)) });
+      groups[key].lines.push({ id: uid(), account: parseTemplateAccount(data.coa, account), debit: round2(num(debit)), credit: round2(num(credit)) });
     });
     const newVouchers = order.map((k) => groups[k]).filter((v) => v.lines.length > 0);
     return { newVouchers };
@@ -886,6 +903,7 @@ async function importJournalExcel(journalKey, file, data) {
     const obj = { id: uid() };
     meta.cols.forEach((c, i) => {
       if (c.field === "date") { obj.date = toMDY(String(r[i] ?? "").trim()); return; }
+      if (TEMPLATE_ACCOUNT_FIELDS.has(c.field)) { obj[c.field] = parseTemplateAccount(data.coa, r[i]); return; }
       obj[c.field] = c.type === "number" ? round2(num(r[i])) : String(r[i] ?? "").trim();
     });
     return obj;
