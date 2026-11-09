@@ -8,7 +8,7 @@ import {
   Receipt, Wallet, ArrowDownToLine, ArrowUpFromLine, ScrollText, Scale,
   ClipboardList, TrendingUp, Landmark, Plus, Trash2, Menu, X, Info,
   ChevronDown, Save, RotateCcw, FileDown, FileUp, BarChart3, RefreshCw, Search, FileText, LogOut,
-  Settings, Check, Coins, Pencil, Undo2, Percent,
+  Settings, Check, Coins, Pencil, Undo2, Percent, Lock,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { doc, onSnapshot, setDoc } from "firebase/firestore";
@@ -315,6 +315,7 @@ export function makeInitialData() {
     ignoredAssetCandidates: [], // source-transaction ids dismissed from the reconciliation notice
     form2307: [],
     employees: [],
+    lockPeriod: null, // { year, month } — transactions dated through the end of that month are closed
   };
 }
 
@@ -1587,6 +1588,61 @@ function reclassPosting(setData, posting, newCode) {
 }
 
 
+/* ============================== LOCK PERIOD ============================== */
+
+// data.lockPeriod = { year, month } (month 0-11) or null. Every transaction dated on or before the
+// last day of that month is closed: it can't be added, edited or deleted until the lock is moved back.
+const LOCKED_JOURNALS = [
+  ["sales", "Sales Journal"], ["purchases", "Purchase Journal"], ["disbursements", "Cash Disbursements"],
+  ["receipts", "Cash Receipts"], ["generalJournal", "General Journal"],
+];
+const LockPeriodContext = React.createContext(null);
+function lockEndDate(lock) {
+  if (!lock || lock.year == null || lock.month == null) return null;
+  return monthEnd(Number(lock.year), Number(lock.month));
+}
+function lockLabel(lock) { return lock ? `${MONTHS[lock.month]} ${lock.year}` : ""; }
+function lockEndMDY(lock) {
+  const d = lockEndDate(lock);
+  return d ? `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())}/${d.getFullYear()}` : "";
+}
+function isDateLocked(dateStr, lock) {
+  const end = lockEndDate(lock);
+  const d = parseAppDate(dateStr);
+  return !!(end && d && d <= end);
+}
+// Counts rows in the locked period that `next` adds, changes or removes relative to `prev`.
+function lockViolations(prev, next, lock) {
+  if (!lockEndDate(lock)) return [];
+  const out = [];
+  LOCKED_JOURNALS.forEach(([key, label]) => {
+    const a = prev[key] || [], b = next[key] || [];
+    if (a === b) return;
+    const before = new Map(a.map((r) => [r.id, r]));
+    const after = new Map(b.map((r) => [r.id, r]));
+    let n = 0;
+    new Set([...before.keys(), ...after.keys()]).forEach((id) => {
+      const x = before.get(id), y = after.get(id);
+      if (x === y) return;
+      if (!isDateLocked(x && x.date, lock) && !isDateLocked(y && y.date, lock)) return;
+      if (x && y && JSON.stringify(x) === JSON.stringify(y)) return;
+      n++;
+    });
+    if (n) out.push(`${n} ${label} row${n === 1 ? "" : "s"}`);
+  });
+  return out;
+}
+
+function LockedPeriodNotice({ dates }) {
+  const lock = React.useContext(LockPeriodContext);
+  if (!(dates || []).some((d) => isDateLocked(d, lock))) return null;
+  return (
+    <div className="lock-notice">
+      <Lock size={14} /> The books are locked through <strong>{lockLabel(lock)}</strong>. Use a date after {lockEndMDY(lock)}, or move the lock period in Settings.
+    </div>
+  );
+}
+
 function monthEnd(year, monthIdx) { return new Date(year, monthIdx + 1, 0); }
 function inRange(dateStr, start, end) {
   const d = parseAppDate(dateStr);
@@ -2246,6 +2302,26 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
     }
   };
 
+  // Pages get a setData that refuses any change touching a transaction in the lock period — this
+  // catches inline edits, deletes, imports, reclasses and petty-cash postings, not just the entry forms.
+  const [lockMsg, setLockMsg] = useState(null);
+  const lockMsgTimer = useRef(null);
+  const guardedSetData = useCallback((update) => {
+    setData((prev) => {
+      const next = typeof update === "function" ? update(prev) : update;
+      const hits = lockViolations(prev, next, prev.lockPeriod);
+      if (!hits.length) return next;
+      const text = `Not saved — the books are locked through ${lockLabel(prev.lockPeriod)} (${hits.join(", ")} affected). Move the lock period in Settings to change them.`;
+      setTimeout(() => {
+        setLockMsg(text);
+        clearTimeout(lockMsgTimer.current);
+        lockMsgTimer.current = setTimeout(() => setLockMsg(null), 7000);
+      }, 0);
+      return prev;
+    });
+  }, []);
+  const setLockPeriod = (lock) => setData((d) => ({ ...d, lockPeriod: lock }));
+
   const postings = useMemo(() => buildPostings(data), [data]);
   const coaMap = useMemo(() => Object.fromEntries(data.coa.map((a) => [a.code, a])), [data.coa]);
 
@@ -2256,6 +2332,7 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
   const pageMeta = NAV.flatMap((g) => g.items).find((i) => i.key === page);
 
   return (
+    <LockPeriodContext.Provider value={data.lockPeriod}>
     <div className="ph-books">
       <Style />
       <div className={"sidebar" + (navOpen ? " open" : "")}>
@@ -2302,36 +2379,36 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
         </div>
         <div className="content">
           {page === "dashboard" && <Dashboard data={data} postings={postings} coaMap={coaMap} onLoadSample={loadSample} />}
-          {page === "company" && <CompanyPage data={data} setData={setData} saveState={saveState} />}
-          {page === "coa" && <CoaPage data={data} setData={setData} />}
-          {page === "customers" && <CustomersPage data={data} setData={setData} />}
-          {page === "suppliers" && <SuppliersPage data={data} setData={setData} />}
-          {page === "items" && <ItemRecordPage data={data} setData={setData} />}
-          {page === "atc" && <AtcReferencePage data={data} setData={setData} />}
-          {page === "vattypes" && <VatTypesPage data={data} setData={setData} />}
-          {page === "sales" && <SalesPage data={data} setData={setData} />}
-          {page === "purchases" && <PurchasesPage data={data} setData={setData} />}
-          {page === "disbursements" && <DisbursementsPage data={data} setData={setData} />}
-          {page === "receipts" && <ReceiptsPage data={data} setData={setData} />}
-          {page === "generaljournal" && <GeneralJournalPage data={data} setData={setData} />}
-          {page === "pettycash" && <PettyCashPage data={data} setData={setData} />}
-          {page === "fixedassets" && <FixedAssetLedgerPage data={data} setData={setData} />}
+          {page === "company" && <CompanyPage data={data} setData={guardedSetData} saveState={saveState} />}
+          {page === "coa" && <CoaPage data={data} setData={guardedSetData} />}
+          {page === "customers" && <CustomersPage data={data} setData={guardedSetData} />}
+          {page === "suppliers" && <SuppliersPage data={data} setData={guardedSetData} />}
+          {page === "items" && <ItemRecordPage data={data} setData={guardedSetData} />}
+          {page === "atc" && <AtcReferencePage data={data} setData={guardedSetData} />}
+          {page === "vattypes" && <VatTypesPage data={data} setData={guardedSetData} />}
+          {page === "sales" && <SalesPage data={data} setData={guardedSetData} />}
+          {page === "purchases" && <PurchasesPage data={data} setData={guardedSetData} />}
+          {page === "disbursements" && <DisbursementsPage data={data} setData={guardedSetData} />}
+          {page === "receipts" && <ReceiptsPage data={data} setData={guardedSetData} />}
+          {page === "generaljournal" && <GeneralJournalPage data={data} setData={guardedSetData} />}
+          {page === "pettycash" && <PettyCashPage data={data} setData={guardedSetData} />}
+          {page === "fixedassets" && <FixedAssetLedgerPage data={data} setData={guardedSetData} />}
           {page === "generalledger" && <GeneralLedgerDetailPage data={data} postings={postings} coaMap={coaMap} />}
-          {page === "vat" && <VatSchedulePage data={data} setData={setData} postings={postings} />}
-          {page === "ewt" && <EwtSchedulePage data={data} setData={setData} postings={postings} />}
+          {page === "vat" && <VatSchedulePage data={data} setData={guardedSetData} postings={postings} />}
+          {page === "ewt" && <EwtSchedulePage data={data} setData={guardedSetData} postings={postings} />}
           {page === "ledger" && <GeneralLedgerPage data={data} postings={postings} coaMap={coaMap} />}
-          {page === "transactions" && <TransactionDetailsPage data={data} setData={setData} postings={postings} coaMap={coaMap} />}
+          {page === "transactions" && <TransactionDetailsPage data={data} setData={guardedSetData} postings={postings} coaMap={coaMap} />}
           {page === "trial" && <TrialBalancePage data={data} postings={postings} coaMap={coaMap} />}
-          {page === "income" && <IncomeStatementPage data={data} setData={setData} postings={postings} coaMap={coaMap} />}
+          {page === "income" && <IncomeStatementPage data={data} setData={guardedSetData} postings={postings} coaMap={coaMap} />}
           {page === "balance" && <BalanceSheetPage data={data} postings={postings} coaMap={coaMap} />}
           {page === "apaging" && <AgingReportPage data={data} side="AP" />}
           {page === "araging" && <AgingReportPage data={data} side="AR" />}
-          {page === "importation" && <ImportationLedgerPage data={data} setData={setData} />}
+          {page === "importation" && <ImportationLedgerPage data={data} setData={guardedSetData} />}
           {page === "slspi" && <SLSPIPage data={data} />}
           {page === "qap" && <QAPPage data={data} />}
           {page === "sawt" && <SAWTPage data={data} />}
-          {page === "form2307" && <Form2307Page data={data} setData={setData} />}
-          {page === "alphalist" && <AlphalistEmployeesPage data={data} setData={setData} />}
+          {page === "form2307" && <Form2307Page data={data} setData={guardedSetData} />}
+          {page === "alphalist" && <AlphalistEmployeesPage data={data} setData={guardedSetData} />}
           {page === "settings" && (
             <SettingsPage
               backupMsg={backupMsg}
@@ -2339,6 +2416,9 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
               onImportBackup={() => backupInputRef.current?.click()}
               onResetWorkbook={resetAll}
               onSignOut={onSignOut}
+              lockPeriod={data.lockPeriod}
+              onSetLockPeriod={setLockPeriod}
+              years={getAvailableYears(data)}
             />
           )}
         </div>
@@ -2347,16 +2427,55 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
         <ConfirmModal title={confirmDialog.title} message={confirmDialog.message} confirmLabel={confirmDialog.confirmLabel} danger={confirmDialog.danger}
           onCancel={() => setConfirmDialog(null)} onConfirm={confirmDialog.onConfirm} />
       )}
+      {lockMsg && (
+        <div className="lock-toast" role="alert">
+          <Lock size={15} /><span>{lockMsg}</span>
+          <button className="modal-close" onClick={() => setLockMsg(null)}><X size={14} /></button>
+        </div>
+      )}
     </div>
+    </LockPeriodContext.Provider>
   );
 }
 
 /* ============================== SETTINGS ============================== */
 
-function SettingsPage({ backupMsg, onExportBackup, onImportBackup, onResetWorkbook, onSignOut }) {
+function SettingsPage({ backupMsg, onExportBackup, onImportBackup, onResetWorkbook, onSignOut, lockPeriod, onSetLockPeriod, years }) {
+  const lastMonth = new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1);
+  const [draft, setDraft] = useState(lockPeriod || { year: lastMonth.getFullYear(), month: lastMonth.getMonth() });
+  useEffect(() => { if (lockPeriod) setDraft(lockPeriod); }, [lockPeriod]);
+  const dirty = !lockPeriod || lockPeriod.year !== draft.year || lockPeriod.month !== draft.month;
   return (
     <div>
-      <SectionHeader icon={Settings} title="Settings" subtitle="Back up or restore this client's books, start over, or sign out." />
+      <SectionHeader icon={Settings} title="Settings" subtitle="Lock closed periods, back up or restore this client's books, start over, or sign out." />
+
+      <div className="settings-section">
+        <div className="settings-section-head">
+          <h3>Lock period</h3>
+          <p>
+            Close the books through a month. Transactions dated on or before the end of that month can't be added,
+            edited or deleted in the Sales, Purchase, Cash Disbursements, Cash Receipts or General Journal.
+          </p>
+        </div>
+        <div className="lock-status">
+          <Lock size={14} />
+          {lockPeriod
+            ? <span>Locked through <strong>{lockLabel(lockPeriod)}</strong> — entries dated {lockEndMDY(lockPeriod)} or earlier are closed.</span>
+            : <span>No lock — every period is open.</span>}
+        </div>
+        <div className="settings-actions">
+          <select className="pnl-select" value={draft.month} onChange={(e) => setDraft((p) => ({ ...p, month: Number(e.target.value) }))}>
+            {MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}
+          </select>
+          <select className="pnl-select" value={draft.year} onChange={(e) => setDraft((p) => ({ ...p, year: Number(e.target.value) }))}>
+            {years.map((y) => <option key={y} value={y}>{y}</option>)}
+          </select>
+          <button className="settings-btn" onClick={() => onSetLockPeriod({ year: draft.year, month: draft.month })} disabled={!dirty}>
+            <Lock size={15} /> {lockPeriod ? "Update lock" : "Lock period"}
+          </button>
+          {lockPeriod && <button className="settings-btn" onClick={() => onSetLockPeriod(null)}><Undo2 size={15} /> Remove lock</button>}
+        </div>
+      </div>
 
       <div className="settings-section">
         <div className="settings-section-head">
@@ -2849,8 +2968,11 @@ function ConfirmModal({ title, message, confirmLabel, danger, onCancel, onConfir
   );
 }
 
-export function EntryModalShell({ title, onCancel, onSubmit, submitLabel, children }) {
+// lockDates: the entry's dates (new and, when editing, original) — submit is disabled if any falls in the lock period.
+export function EntryModalShell({ title, onCancel, onSubmit, submitLabel, children, lockDates }) {
   const overlay = useOverlayClose(onCancel);
+  const lock = React.useContext(LockPeriodContext);
+  const locked = (lockDates || []).some((d) => isDateLocked(d, lock));
   return (
     <div className="modal-overlay" {...overlay}>
       <div className="modal-box" onClick={(e) => e.stopPropagation()}>
@@ -2859,9 +2981,10 @@ export function EntryModalShell({ title, onCancel, onSubmit, submitLabel, childr
           <button className="modal-close" onClick={onCancel}><X size={16} /></button>
         </div>
         <div className="modal-body">{children}</div>
+        {locked && <LockedPeriodNotice dates={lockDates} />}
         <div className="modal-foot">
           <button className="btn-outline" onClick={onCancel}>Cancel</button>
-          <button className="primary-btn" onClick={onSubmit}>{submitLabel || "Add"}</button>
+          <button className="primary-btn" onClick={onSubmit} disabled={locked}>{submitLabel || "Add"}</button>
         </div>
       </div>
     </div>
@@ -2959,7 +3082,7 @@ function SalesEntryModal({ data, setData, initialRows, onCancel, onSubmit }) {
     desc: l.desc, vatable: num(l.vatable), exempt: num(l.exempt), zeroRated: num(l.zeroRated), coaCode: l.coaCode,
   })));
   return (
-    <EntryModalShell title={editing ? "Edit Sale" : "Add Sale"} submitLabel={entrySubmitLabel(editing, lines.length, "sale")} onCancel={onCancel} onSubmit={handleSubmit}>
+    <EntryModalShell title={editing ? "Edit Sale" : "Add Sale"} lockDates={[h.date, first && first.date]} submitLabel={entrySubmitLabel(editing, lines.length, "sale")} onCancel={onCancel} onSubmit={handleSubmit}>
       <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
       <LabeledField label="SI/OR No."><Field value={h.siNo} onChange={(x) => setHeader("siNo", x)} placeholder="SI-0001" /></LabeledField>
       <LabeledField label="Customer Name"><Field type="combo" options={custOptions} value={h.customer} onChange={onCustomer}
@@ -3054,7 +3177,7 @@ function PurchaseEntryModal({ data, setData, initialRows, onCancel, onSubmit }) 
   })));
 
   return (
-    <EntryModalShell title={editing ? "Edit Purchase" : "Add Purchase"} submitLabel={entrySubmitLabel(editing, lines.length, "purchase")} onCancel={onCancel} onSubmit={handleSubmit}>
+    <EntryModalShell title={editing ? "Edit Purchase" : "Add Purchase"} lockDates={[h.date, first && first.date]} submitLabel={entrySubmitLabel(editing, lines.length, "purchase")} onCancel={onCancel} onSubmit={handleSubmit}>
       <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
       <LabeledField label="Supplier Inv./OR"><Field value={h.invNo} onChange={(x) => setHeader("invNo", x)} /></LabeledField>
       <LabeledField label="Supplier Name"><Field type="combo" options={suppOptions} value={h.supplier} onChange={applySupplier}
@@ -3150,7 +3273,7 @@ function DisbEntryModal({ data, setData, initialRows, onCancel, onSubmit }) {
   })));
 
   return (
-    <EntryModalShell title={editing ? "Edit Disbursement" : "Add Disbursement"} submitLabel={entrySubmitLabel(editing, lines.length, "disbursement")} onCancel={onCancel} onSubmit={handleSubmit}>
+    <EntryModalShell title={editing ? "Edit Disbursement" : "Add Disbursement"} lockDates={[h.date, first && first.date]} submitLabel={entrySubmitLabel(editing, lines.length, "disbursement")} onCancel={onCancel} onSubmit={handleSubmit}>
       <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
       <LabeledField label="TIN"><Field value={h.tin} onChange={(x) => setHeader("tin", x)} /></LabeledField>
       <LabeledField label="Suppliers Name"><Field type="combo" options={suppOptions} value={h.vendor} onChange={applySupplier}
@@ -3238,7 +3361,7 @@ function ReceiptEntryModal({ data, setData, initialRows, onCancel, onSubmit }) {
     appliedToSalesId: l.appliedToSalesId || "",
   })));
   return (
-    <EntryModalShell title={editing ? "Edit Receipt" : "Add Receipt"} submitLabel={entrySubmitLabel(editing, lines.length, "receipt")} onCancel={onCancel} onSubmit={handleSubmit}>
+    <EntryModalShell title={editing ? "Edit Receipt" : "Add Receipt"} lockDates={[h.date, first && first.date]} submitLabel={entrySubmitLabel(editing, lines.length, "receipt")} onCancel={onCancel} onSubmit={handleSubmit}>
       <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
       <LabeledField label="Received From"><Field type="combo" options={custOptions} value={h.from} onChange={onFrom}
         onAddNew={(typed) => setQuickAdd(typed)} addNewLabel="customer" /></LabeledField>
@@ -3309,7 +3432,7 @@ function JournalVoucherModal({ data, onCancel, onSubmit, nextJvNo, initial, titl
   const creditSum = round2(lines.reduce((a, l) => a + num(l.credit), 0));
   const balanced = debitSum === creditSum && debitSum > 0;
   return (
-    <EntryModalShell title={title || "Add Journal Voucher"} submitLabel={submitLabel || "Add voucher"} onCancel={onCancel}
+    <EntryModalShell title={title || "Add Journal Voucher"} submitLabel={submitLabel || "Add voucher"} onCancel={onCancel} lockDates={[date, initial && initial.id && initial.date]}
       onSubmit={() => onSubmit({ id: uid(), jvNo, date, particulars, lines: lines.map((l) => ({ id: uid(), account: l.account, debit: num(l.debit), credit: num(l.credit) })) })}>
       <LabeledField label="JV No."><Field value={jvNo} onChange={(v) => { setJvNo(v); setJvNoTouched(true); }} placeholder="JV-2026-001" /></LabeledField>
       <LabeledField label="Date"><Field type="date" value={date} onChange={setDate} /></LabeledField>
@@ -9218,6 +9341,12 @@ function Style() {
       .settings-actions { display: flex; flex-wrap: wrap; gap: 10px; }
       .settings-btn { display: inline-flex; align-items: center; gap: 7px; background: var(--white); border: 1px solid var(--line); color: var(--ink); font-size: 13px; font-weight: 500; padding: 9px 14px; border-radius: 7px; cursor: pointer; }
       .settings-btn:hover { background: var(--paper-deep); border-color: var(--green); }
+      .settings-btn:disabled { opacity: .5; cursor: default; background: var(--white); border-color: var(--line); }
+      .lock-status { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink); margin-bottom: 12px; }
+      .lock-notice { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin: 0 20px 12px; padding: 9px 12px; border-radius: 7px; background: #FBECEC; border: 1px solid #E7C9C9; color: var(--red); font-size: 12.5px; line-height: 1.45; }
+      .lock-toast { position: fixed; right: 20px; bottom: 20px; z-index: 1000; max-width: 440px; display: flex; align-items: flex-start; gap: 9px; padding: 12px 14px; border-radius: 9px; background: #FBECEC; border: 1px solid #E7C9C9; color: var(--red); font-size: 13px; line-height: 1.45; box-shadow: 0 6px 24px rgba(0,0,0,.12); }
+      .lock-toast svg { flex-shrink: 0; margin-top: 2px; }
+      @media (max-width: 600px) { .lock-toast { left: 16px; right: 16px; max-width: none; } }
       .settings-btn.danger { color: var(--red); border-color: #E7C9C9; }
       .settings-btn.danger:hover { background: #FBECEC; border-color: var(--red); }
       .content .backup-msg { margin-top: 12px; font-size: 12.5px; color: var(--green-deep); background: var(--paper-deep); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
