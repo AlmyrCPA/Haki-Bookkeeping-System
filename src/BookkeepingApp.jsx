@@ -8,11 +8,18 @@ import {
   Receipt, Wallet, ArrowDownToLine, ArrowUpFromLine, ScrollText, Scale,
   ClipboardList, TrendingUp, Landmark, Plus, Trash2, Menu, X, Info,
   ChevronDown, Save, RotateCcw, FileDown, FileUp, BarChart3, RefreshCw, Search, FileText, LogOut,
-  Settings, Check, Coins, Pencil, Undo2, Percent, Lock,
+  Settings, Check, Coins, Pencil, Undo2, Percent, Lock, UserRound,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { doc, onSnapshot, setDoc } from "firebase/firestore";
 import { db } from "./firebase";
+import { EmployeesRecordPage, employeeDisplayName, alphalistFieldsFromRecord, normalizeImportedEmployeeRecords } from "./tax/EmployeesRecord";
+import { Form1601CPage } from "./tax/Form1601C";
+import { QuarterlyTaxPage } from "./tax/QuarterlyTax";
+import { EwtReturnsPage } from "./tax/EwtReturns";
+import { IncomeQuarterlyPage } from "./tax/IncomeQuarterly";
+import { IncomeAnnualPage } from "./tax/IncomeAnnual";
+import { AnnualInfoPage, downloadEmployeeAlphalistPdf } from "./tax/AnnualInfo";
 
 /* ============================== CONSTANTS ============================== */
 
@@ -242,6 +249,19 @@ export const emptyCompany = {
   vatStatus: "VAT Registered",
   // Payor's Authorized Representative — feeds the 2307 certificate's signature block.
   authorizedSignatory: "", signatoryPosition: "", signatoryTin: "", signatureImage: "",
+  // Shared by the BIR return tabs (1601-C, 2550Q/2551Q, 0619-E/1601-EQ, 1701Q/1702Q, 1701/1702-RT, 1604-C/E).
+  contactNumber: "", email: "", withholdingCategory: "Private", topWithholdingAgent: "No",
+  fiscalYearEndMonth: 12, yearBusinessStarted: "", dateIncorporation: "",
+  // Individuals
+  dateOfBirth: "", citizenship: "Filipino", civilStatus: "Single", spouseHasIncome: "No",
+  spouseName: "", spouseTin: "", spouseEmployer: "", filerKind: "Business", taxRateElection: "Graduated + Itemized",
+  foreignTaxNumber: "", claimsForeignTaxCredit: "No",
+  // Non-individuals
+  deductionMethod: "Itemized", incomeTaxRegime: "Regular 25%", taxRelief: "No", taxReliefSpecify: "",
+  incomeExempt: "No", incomeSpecialRate: "No",
+  treasurerName: "", treasurerTitle: "", treasurerTin: "",
+  // Tax agent (optional)
+  taxAgentAccreditationNo: "", taxAgentIssueDate: "", taxAgentExpiryDate: "", taxAgentTin: "", taxAgentRollNo: "", taxAgentMcle: "",
 };
 
 const NAV = [
@@ -254,6 +274,7 @@ const NAV = [
     { key: "customers", label: "Customers Master", icon: Users },
     { key: "suppliers", label: "Suppliers Master", icon: Truck },
     { key: "items", label: "Item Record", icon: ListChecks },
+    { key: "employeerecords", label: "Employees Record", icon: UserRound },
     { key: "atc", label: "ATC Reference", icon: ListChecks },
     { key: "vattypes", label: "VAT Type", icon: Scale },
   ]},
@@ -282,18 +303,32 @@ const NAV = [
     { key: "importation", label: "Importation Ledger", icon: ArrowDownToLine },
     { key: "slspi", label: "SLSPI", icon: FileText },
     { key: "qap", label: "QAP", icon: FileText },
+    { key: "ewtreturns", label: "0619-E / 1601-EQ", icon: FileText },
     { key: "sawt", label: "SAWT", icon: FileText },
     { key: "form2307", label: "Creditable Withholding Taxes", icon: FileText },
+    { key: "form1601c", label: "1601-C", icon: FileText },
+    { key: "quarterlytax", label: "2550Q - Quarterly VAT", icon: FileText },
+    { key: "incomeq", label: "1702Q", icon: FileText },
+    { key: "incomeannual", label: "1702-RT", icon: FileText },
+    { key: "annualinfo", label: "1604-C / 1604-E", icon: FileText },
     { key: "alphalist", label: "Alphalist of Employees", icon: FileText },
   ]},
 ];
+// Some Tax Compliance labels follow Company Details (VAT status / taxpayer type).
+function navLabel(item, company) {
+  const c = company || {};
+  if (item.key === "quarterlytax") return c.vatStatus === "Non-VAT" ? "2551Q - Percentage Tax" : "2550Q - Quarterly VAT";
+  if (item.key === "incomeq") return c.taxpayerType === "Individual" ? "1701Q" : "1702Q";
+  if (item.key === "incomeannual") return c.taxpayerType === "Individual" ? "1701" : "1702-RT";
+  return item.label;
+}
 
 /* ============================== INITIAL STATE ============================== */
 
 export function makeInitialData() {
   return {
     company: { ...emptyCompany },
-    coa: DEFAULT_COA,
+    coa: fillItrLineDefaults(DEFAULT_COA),
     items: DEFAULT_ITEMS,
     atc: DEFAULT_ATC,
     vatTypes: DEFAULT_VAT_TYPES,
@@ -315,6 +350,10 @@ export function makeInitialData() {
     ignoredAssetCandidates: [], // source-transaction ids dismissed from the reconciliation notice
     form2307: [],
     employees: [],
+    employeeRecords: [], // Employees Record master file (Setup)
+    // BIR return worksheets, keyed by period: month "2026-10", quarter "2026-Q3", year "2026"
+    form1601c: {}, form2550q: {}, form2551q: {}, form0619e: {}, form1601eq: {},
+    form1701q: {}, form1702q: {}, form1701: {}, form1702: {}, form1604c: {}, form1604e: {},
     lockPeriod: null, // { year, month } — transactions dated through the end of that month are closed
   };
 }
@@ -369,13 +408,46 @@ function fixSwappedVatTypeDefaults(vatTypes) {
   });
 }
 
+// Income tax return (1701 Schedule 4 / 1702-RT Schedule I) deduction lines an expense account maps to.
+const ITR_LINES = [
+  "1 Amortizations", "2 Bad debts", "3 Charitable contributions", "4 Depletion", "5 Depreciation",
+  "6 Entertainment, amusement and recreation", "7 Fringe benefits", "8 Interest", "9 Losses", "10 Pension trusts",
+  "11 Rental", "12 Research and development", "13 Salaries, wages and allowances",
+  "14 SSS, GSIS, PhilHealth, HDMF and other contributions", "15 Taxes and licenses", "16 Transportation and travel",
+  "17a Janitorial and messengerial", "17b Professional fees", "17c Security services", "17d Others",
+];
+const ITR_NON_DEDUCTIBLE = "Non-deductible";
+const ITR_LINE_OPTIONS = [...ITR_LINES, ITR_NON_DEDUCTIBLE];
+function guessItrLine(a) {
+  const n = String(a.name || "").toLowerCase();
+  if (/income tax/.test(n) || /income tax/i.test(a.category || "")) return ITR_NON_DEDUCTIBLE;
+  const rules = [
+    [/sss|philhealth|phic|hdmf|pag-?ibig|contribution/, 14], [/salar|wage|allowance|13th|bonus/, 13], [/depletion/, 4],
+    [/depreciation/, 5], [/amorti/, 1], [/bad debt/, 2], [/charit|donation/, 3], [/represent|entertain|amusement/, 6],
+    [/fringe/, 7], [/interest/, 8], [/pension|retirement/, 10], [/rent/, 11], [/research/, 12],
+    [/taxes and licen|license|permit/, 15], [/transport|travel|gas and oil|fuel|parking|toll/, 16],
+    [/janitor|messeng/, "17a"], [/professional|brokerage|legal|audit|accounting fee|consult/, "17b"], [/security/, "17c"], [/loss/, 9],
+  ];
+  const hit = rules.find(([re]) => re.test(n));
+  return hit ? ITR_LINES.find((l) => l.startsWith(hit[1] + " ")) : "";
+}
+// Fills itrLine once per expense account (undefined only), so a user choice, including a blank, is never overwritten.
+function fillItrLineDefaults(coa) {
+  if (!Array.isArray(coa)) return coa;
+  return coa.map((a) => (a.type === "Expense" && a.itrLine === undefined) ? { ...a, itrLine: guessItrLine(a) } : a);
+}
+
 function normalizeDatesInData(d) {
   const fixRows = (arr) => (arr || []).map((r) => ({ ...r, date: toMDY(r.date) }));
+  const nonVat = d.company && d.company.vatStatus === "Non-VAT";
   return {
     ...d,
+    ...(Array.isArray(d.coa) ? { coa: fillItrLineDefaults(d.coa) } : {}),
+    ...(d.company ? { company: { ...emptyCompany, ...d.company } } : {}),
     ...(Array.isArray(d.vatTypes) ? { vatTypes: fixSwappedVatTypeDefaults(d.vatTypes) } : {}),
     ...(Array.isArray(d.atc) ? { atc: fixAtcDefaults(d.atc) } : {}),
-    sales: fixRows(d.sales),
+    // Non-VAT companies: older rows were saved with 12% output VAT; recompute them without it.
+    sales: nonVat ? fixRows(d.sales).map((r) => (num(r.outputVat) ? computeSalesRow(r, false) : r)) : fixRows(d.sales),
     purchases: fixRows(d.purchases),
     disbursements: fixRows(d.disbursements),
     receipts: fixRows(d.receipts),
@@ -386,9 +458,12 @@ function normalizeDatesInData(d) {
 
 /* ============================== ROW COMPUTE HELPERS ============================== */
 
-function computeSalesRow(r) {
+// A Non-VAT company charges no output VAT, so its sales rows carry outputVat 0 and the total is the
+// gross receipts as entered. Callers pass isVatCompany(data); omitted = VAT Registered (old behavior).
+const isVatCompany = (data) => ((data && data.company && data.company.vatStatus) || "VAT Registered") !== "Non-VAT";
+function computeSalesRow(r, isVat = true) {
   const vatable = num(r.vatable), exempt = num(r.exempt), zeroRated = num(r.zeroRated);
-  const outputVat = round2(vatable * 0.12);
+  const outputVat = isVat ? round2(vatable * 0.12) : 0;
   const total = round2(vatable + exempt + zeroRated + outputVat);
   return { ...r, outputVat, total };
 }
@@ -613,6 +688,45 @@ const EMPLOYEE_COLS = [
   { header: "5% Tax Credit (PERA Act of 2008)", field: "taxCredit5pct", type: "number" },
   { header: "Substituted Filing (Y/N)", field: "substitutedFiling" },
 ];
+// Employees Record (Setup) — the master file the 1601-C, Alphalist and 1604-C read from.
+const EMPLOYEE_RECORD_COLS = [
+  { header: "Employee No.", field: "empNo" },
+  { header: "TIN", field: "tin" },
+  { header: "Last Name", field: "lastName" },
+  { header: "First Name", field: "firstName" },
+  { header: "Middle Name", field: "middleName" },
+  { header: "Suffix", field: "suffix" },
+  { header: "Date of Birth (MM/DD/YYYY)", field: "dob" },
+  { header: "Nationality", field: "nationality" },
+  { header: "Telephone / Mobile", field: "phone" },
+  { header: "Email", field: "email" },
+  { header: "Home Address Line 1", field: "addr1" },
+  { header: "Home Address Line 2", field: "addr2" },
+  { header: "ZIP Code", field: "zipCode" },
+  { header: "Foreign Address", field: "foreignAddress" },
+  { header: "SSS No.", field: "sssNo" },
+  { header: "PhilHealth No.", field: "philhealthNo" },
+  { header: "Pag-IBIG No.", field: "pagibigNo" },
+  { header: "Date Hired (MM/DD/YYYY)", field: "dateHired" },
+  { header: "Date Separated (MM/DD/YYYY)", field: "dateSeparated" },
+  { header: "Employment Status (R/CP/C/P/S)", field: "empStatus" },
+  { header: "Reason for Separation (NA/T/R/D/RT)", field: "sepReason" },
+  { header: "Position", field: "position" },
+  { header: "Department", field: "department" },
+  { header: "Employer Type (Main/Secondary)", field: "employerType" },
+  { header: "Region", field: "region" },
+  { header: "Statutory Minimum Wage Earner (Y/N)", field: "isMWE" },
+  { header: "SMW Per Day", field: "smwPerDay", type: "number" },
+  { header: "SMW Per Month", field: "smwPerMonth", type: "number" },
+  { header: "SMW Per Year", field: "smwPerYear", type: "number" },
+  { header: "Factor (Days/Year)", field: "factorDaysPerYear", type: "number" },
+  { header: "Default Monthly Basic Pay", field: "defaultMonthlyBasic", type: "number" },
+  { header: "Substituted Filing (Y/N)", field: "substitutedFiling" },
+  { header: "Previous Employer Name", field: "prevEmployerName" },
+  { header: "Previous Employer TIN", field: "prevEmployerTin" },
+  { header: "Previous Employer Address", field: "prevEmployerAddress" },
+  { header: "Previous Employer ZIP", field: "prevEmployerZip" },
+];
 const GJ_COLS = [
   { header: "JV No.", field: "jvNo" },
   { header: "Date (MM/DD/YYYY)", field: "date" },
@@ -657,6 +771,7 @@ const JOURNAL_SHEETS = {
   fixedassets: { title: "Fixed Asset Ledger", cols: FIXEDASSET_COLS, dataKey: "fixedAssets" },
   form2307: { title: "Creditable Withholding Taxes", cols: FORM2307_COLS, dataKey: "form2307" },
   employees: { title: "Alphalist of Employees", cols: EMPLOYEE_COLS, dataKey: "employees" },
+  employeerecords: { title: "Employees Record", cols: EMPLOYEE_RECORD_COLS, dataKey: "employeeRecords" },
 };
 // Sheet names that are NOT the entry sheet in an import workbook — used to locate the entry
 // sheet by elimination. Includes the reference/context tabs and the dropdown "Lists" tab.
@@ -712,7 +827,10 @@ const TEMPLATE_FIXED_LISTS = {
   "Terms": TERMS,
   "Bank Account": BANK_ACCOUNTS,
   "Yes / No": ["Y", "N"],
+  "No / Yes": ["No", "Yes"],
   "Employment Status": ["R", "CP", "C", "P", "S"],
+  "Separation Reason": ["NA", "T", "R", "D", "RT"],
+  "Employer Type": ["Main", "Secondary"],
   "Item Type": ITEM_TYPES,
   "COA Class": COA_TYPES,
   "COA Subclass": COA_SUBCLASSES,
@@ -734,12 +852,13 @@ const JOURNAL_TEMPLATE_DROPDOWNS = {
   fixedassets: { assetAccount: { sheet: "Chart of Accounts", col: "D" }, accumDepAccount: { sheet: "Chart of Accounts", col: "D" }, depExpenseAccount: { sheet: "Chart of Accounts", col: "D" }, status: { list: "Asset Status" } },
   form2307: { atc: { sheet: "ATC Reference", col: "A" } },
   employees: { isMWE: { list: "Yes / No" }, substitutedFiling: { list: "Yes / No" }, empStatus: { list: "Employment Status" }, prevEmpStatus: { list: "Employment Status" } },
+  employeerecords: { isMWE: { list: "Yes / No" }, substitutedFiling: { list: "Yes / No" }, empStatus: { list: "Employment Status" }, sepReason: { list: "Separation Reason" }, employerType: { list: "Employer Type" } },
 };
 
 const MASTER_TEMPLATE_DROPDOWNS = {
   "Chart of Accounts": { type: { list: "COA Class" }, category: { list: "COA Subclass" }, accountType: { list: "COA Account Type" } },
-  "Customers Master": { type: { list: "Party Type" } },
-  "Suppliers Master": { type: { list: "Party Type" }, itemCode: { sheet: "Item Record", col: "A" }, accountTitle: { sheet: "Chart of Accounts", col: "B" } },
+  "Customers Master": { type: { list: "Party Type" }, government: { list: "No / Yes" } },
+  "Suppliers Master": { type: { list: "Party Type" }, exemptFromWht: { list: "No / Yes" }, itemCode: { sheet: "Item Record", col: "A" }, accountTitle: { sheet: "Chart of Accounts", col: "B" } },
   "Item Record": { account: { sheet: "Chart of Accounts", col: "A" }, type: { list: "Item Type" } },
   "ATC Reference": { ewtGroup: { list: "EWT Group" } },
   "VAT Type": { books: { list: "VAT Books" }, slspiField: { list: "SLSPI Field" } },
@@ -918,7 +1037,7 @@ async function importJournalExcel(journalKey, file, data) {
       if (!r.coaCode) r.coaCode = "4000";
       if (!r.terms) r.terms = "Cash";
       if (!r.bankAccount) r.bankAccount = "Cash on Hand";
-      return computeSalesRow(r);
+      return computeSalesRow(r, isVatCompany(data));
     });
   } else if (journalKey === "purchases") {
     newRows = rawRows.map((r) => {
@@ -999,6 +1118,8 @@ async function importJournalExcel(journalKey, file, data) {
       r.substitutedFiling = subFiling === "Y" || subFiling === "YES" ? "Y" : (subFiling === "N" || subFiling === "NO" ? "N" : "");
       return computeEmployeeRow(r);
     });
+  } else if (journalKey === "employeerecords") {
+    newRows = normalizeImportedEmployeeRecords(rawRows, data);
   }
   return { newRows };
 }
@@ -1091,6 +1212,7 @@ const PREVIEW_EXTRA_COLS = {
   fixedassets: [["monthlyDep", "Monthly Dep."], ["accumulatedDep", "Accum. Dep."], ["bookValue", "Book Value"]],
   form2307: [["atcRate", "Rate"], ["cwt", "CWT"]],
   employees: [["pGross", "Gross (Present)"], ["totalTaxableComp", "Total Taxable Comp."], ["taxDue", "Tax Due"]],
+  employeerecords: [],
   generaljournal: [],
   pettycash: [],
 };
@@ -1237,6 +1359,11 @@ function buildExportTable(journalKey, rows, coaByCode) {
     const t = rows.reduce((a, r) => ({ gross: a.gross + num(r.pGross), nonTax: a.nonTax + num(r.pTotalNonTax), tax: a.tax + num(r.pTotalTax), taxableComp: a.taxableComp + num(r.totalTaxableComp), due: a.due + num(r.taxDue), wh: a.wh + num(r.taxWithheldPrev) + num(r.taxWithheldPresent) }), { gross: 0, nonTax: 0, tax: 0, taxableComp: 0, due: 0, wh: 0 });
     const totalsRow = ["", "", "", "", "", "TOTALS", fmtPlain(t.gross), fmtPlain(t.nonTax), fmtPlain(t.tax), fmtPlain(t.taxableComp), fmtPlain(t.due), fmtPlain(t.wh)];
     return { headers, body, totalsRow, numericCols: [6,7,8,9,10,11] };
+  }
+  if (journalKey === "employeerecords") {
+    const headers = ["Emp. No.","TIN","Last Name","First Name","Middle Name","Status","MWE","Date Hired","Date Separated","Position","Department","Active"];
+    const body = rows.map((r) => [r.empNo, r.tin, r.lastName, r.firstName, r.middleName, r.empStatus, r.isMWE === "Y" ? "Yes" : "No", r.dateHired, r.dateSeparated, r.position, r.department, r.active || "Yes"]);
+    return { headers, body, totalsRow: ["", "", `${rows.length} employee(s)`, "", "", "", "", "", "", "", "", ""], numericCols: [] };
   }
   if (journalKey === "fixedassets") {
     const headers = ["Asset Name","Code","Category","Acquisition Date","Dep. Start Date","Cost","Salvage Value","Life (Yrs)","Opening Accum. Dep.","Monthly Dep.","Accum. Dep.","Book Value","Asset Account","Accum. Dep. Account","Dep. Expense Account","Status"];
@@ -1576,7 +1703,7 @@ function buildPostings(data) {
 function reclassPosting(setData, posting, newCode) {
   const { journalKey, rowId, lineId } = posting;
   setData((d) => {
-    if (journalKey === "sales") return { ...d, sales: d.sales.map((r) => r.id === rowId ? computeSalesRow({ ...r, coaCode: newCode }) : r) };
+    if (journalKey === "sales") return { ...d, sales: d.sales.map((r) => r.id === rowId ? computeSalesRow({ ...r, coaCode: newCode }, isVatCompany(d)) : r) };
     if (journalKey === "purchases") return { ...d, purchases: d.purchases.map((r) => r.id === rowId ? computePurchaseRow({ ...r, coaCode: newCode }) : r) };
     if (journalKey === "disbursements") return { ...d, disbursements: d.disbursements.map((r) => r.id === rowId ? computeDisbRow({ ...r, coaCode: newCode }) : r) };
     if (journalKey === "receipts") return { ...d, receipts: d.receipts.map((r) => r.id === rowId ? computeReceiptRow({ ...r, coaCode: newCode }) : r) };
@@ -2352,7 +2479,7 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
               {g.items.map((it) => (
                 <button key={it.key} className={"nav-item" + (page === it.key ? " active" : "")}
                   onClick={() => { setPage(it.key); setNavOpen(false); }}>
-                  <it.icon size={16} strokeWidth={2} /><span>{it.label}</span>
+                  <it.icon size={16} strokeWidth={2} /><span>{navLabel(it, data.company)}</span>
                 </button>
               ))}
             </div>
@@ -2409,6 +2536,13 @@ export default function BookkeepingApp({ clientId, clientSwitcher, onSignOut }) 
           {page === "sawt" && <SAWTPage data={data} />}
           {page === "form2307" && <Form2307Page data={data} setData={guardedSetData} />}
           {page === "alphalist" && <AlphalistEmployeesPage data={data} setData={guardedSetData} />}
+          {page === "employeerecords" && <EmployeesRecordPage data={data} setData={guardedSetData} />}
+          {page === "form1601c" && <Form1601CPage data={data} setData={guardedSetData} postings={postings} onNavigate={setPage} />}
+          {page === "quarterlytax" && <QuarterlyTaxPage data={data} setData={guardedSetData} postings={postings} onNavigate={setPage} />}
+          {page === "ewtreturns" && <EwtReturnsPage data={data} setData={guardedSetData} postings={postings} onNavigate={setPage} />}
+          {page === "incomeq" && <IncomeQuarterlyPage data={data} setData={guardedSetData} postings={postings} onNavigate={setPage} />}
+          {page === "incomeannual" && <IncomeAnnualPage data={data} setData={guardedSetData} postings={postings} onNavigate={setPage} />}
+          {page === "annualinfo" && <AnnualInfoPage data={data} setData={guardedSetData} postings={postings} onNavigate={setPage} />}
           {page === "settings" && (
             <SettingsPage
               backupMsg={backupMsg}
@@ -2735,6 +2869,54 @@ function CompanyPage({ data, setData, saveState }) {
         </div>
       </div>
 
+      <div className="sub-block-title" style={{ marginTop: 28 }}>BIR Return Details</div>
+      <p className="section-head-note">Part I of the BIR return worksheets (1601-C, 2550Q / 2551Q, 0619-E / 1601-EQ, 1701Q / 1702Q, 1701 / 1702-RT, 1604-C / 1604-E) reads these fields. The signatory above signs the returns.</p>
+      <div className="form-card">
+        <div className="form-grid">
+          <LabeledField label="Contact Number"><Field value={c.contactNumber} onChange={(v) => set("contactNumber", v)} /></LabeledField>
+          <LabeledField label="Email Address"><Field value={c.email} onChange={(v) => set("email", v)} /></LabeledField>
+          <LabeledField label="Category of Withholding Agent"><Field type="select" value={c.withholdingCategory} options={["Private", "Government"]} onChange={(v) => set("withholdingCategory", v)} /></LabeledField>
+          <LabeledField label="Top Withholding Agent?"><Field type="select" value={c.topWithholdingAgent} options={["No", "Yes"]} onChange={(v) => set("topWithholdingAgent", v)} /></LabeledField>
+          <LabeledField label="Fiscal Year-End Month"><Field type="select" value={c.fiscalYearEndMonth} options={MONTHS.map((m, i) => ({ value: i + 1, label: m }))} onChange={(v) => set("fiscalYearEndMonth", Number(v) || 12)} /></LabeledField>
+          <LabeledField label="Year Business Started"><Field value={c.yearBusinessStarted} onChange={(v) => set("yearBusinessStarted", v.replace(/\D/g, "").slice(0, 4))} placeholder="YYYY (for MCIT)" /></LabeledField>
+          <LabeledField label="Income exempt from income tax?"><Field type="select" value={c.incomeExempt} options={["No", "Yes"]} onChange={(v) => set("incomeExempt", v)} /></LabeledField>
+          <LabeledField label="Income subject to special / preferential rate?"><Field type="select" value={c.incomeSpecialRate} options={["No", "Yes"]} onChange={(v) => set("incomeSpecialRate", v)} /></LabeledField>
+          <LabeledField label="Tax relief under special law / treaty?"><Field type="select" value={c.taxRelief} options={["No", "Yes"]} onChange={(v) => set("taxRelief", v)} /></LabeledField>
+          {c.taxRelief === "Yes" && <LabeledField label="Tax relief (specify)"><Field value={c.taxReliefSpecify} onChange={(v) => set("taxReliefSpecify", v)} placeholder="e.g. PEZA, BOI" /></LabeledField>}
+          {isIndividual ? (<>
+            <LabeledField label="Filer Kind"><Field type="select" value={c.filerKind} options={["Business", "Professional", "Mixed income"]} onChange={(v) => set("filerKind", v)} /></LabeledField>
+            <LabeledField label="Income Tax Rate / Deduction Election"><Field type="select" value={c.taxRateElection} options={["Graduated + Itemized", "Graduated + OSD", "8%"]} onChange={(v) => set("taxRateElection", v)} /></LabeledField>
+            <LabeledField label="Date of Birth"><Field type="date" value={c.dateOfBirth} onChange={(v) => set("dateOfBirth", v)} /></LabeledField>
+            <LabeledField label="Citizenship"><Field value={c.citizenship} onChange={(v) => set("citizenship", v)} /></LabeledField>
+            <LabeledField label="Foreign Tax Number (if any)"><Field value={c.foreignTaxNumber} onChange={(v) => set("foreignTaxNumber", v)} /></LabeledField>
+            <LabeledField label="Claiming Foreign Tax Credits?"><Field type="select" value={c.claimsForeignTaxCredit} options={["No", "Yes"]} onChange={(v) => set("claimsForeignTaxCredit", v)} /></LabeledField>
+            <LabeledField label="Civil Status"><Field type="select" value={c.civilStatus} options={["Single", "Married", "Legally Separated", "Widow(er)"]} onChange={(v) => set("civilStatus", v)} /></LabeledField>
+            {c.civilStatus === "Married" && (<>
+              <LabeledField label="Spouse has income?"><Field type="select" value={c.spouseHasIncome} options={["No", "Yes"]} onChange={(v) => set("spouseHasIncome", v)} /></LabeledField>
+              <LabeledField label="Spouse Name"><Field value={c.spouseName} onChange={(v) => set("spouseName", v)} /></LabeledField>
+              <LabeledField label="Spouse TIN"><Field value={c.spouseTin} onChange={(v) => set("spouseTin", v)} /></LabeledField>
+              <LabeledField label="Spouse Employer"><Field value={c.spouseEmployer} onChange={(v) => set("spouseEmployer", v)} /></LabeledField>
+            </>)}
+          </>) : (<>
+            <LabeledField label="Date of Incorporation"><Field type="date" value={c.dateIncorporation} onChange={(v) => set("dateIncorporation", v)} /></LabeledField>
+            <LabeledField label="Method of Deduction"><Field type="select" value={c.deductionMethod} options={["Itemized", "OSD"]} onChange={(v) => set("deductionMethod", v)} /></LabeledField>
+            <LabeledField label="Income Tax Regime"><Field type="select" value={c.incomeTaxRegime} options={["Regular 25%", "Regular 20%", "Special rate"]} onChange={(v) => set("incomeTaxRegime", v)} /></LabeledField>
+            <LabeledField label="Treasurer / Asst. Treasurer"><Field value={c.treasurerName} onChange={(v) => set("treasurerName", v)} /></LabeledField>
+            <LabeledField label="Treasurer's Title"><Field value={c.treasurerTitle} onChange={(v) => set("treasurerTitle", v)} /></LabeledField>
+            <LabeledField label="Treasurer's TIN"><Field value={c.treasurerTin} onChange={(v) => set("treasurerTin", v)} /></LabeledField>
+          </>)}
+        </div>
+        <div className="sub-block-title">Tax Agent (optional)</div>
+        <div className="form-grid">
+          <LabeledField label="Tax Agent Accreditation No."><Field value={c.taxAgentAccreditationNo} onChange={(v) => set("taxAgentAccreditationNo", v)} /></LabeledField>
+          <LabeledField label="Date of Issue"><Field type="date" value={c.taxAgentIssueDate} onChange={(v) => set("taxAgentIssueDate", v)} /></LabeledField>
+          <LabeledField label="Date of Expiry"><Field type="date" value={c.taxAgentExpiryDate} onChange={(v) => set("taxAgentExpiryDate", v)} /></LabeledField>
+          <LabeledField label="Tax Agent TIN (CPA / GPP)"><Field value={c.taxAgentTin} onChange={(v) => set("taxAgentTin", v)} /></LabeledField>
+          <LabeledField label="Attorney's Roll No."><Field value={c.taxAgentRollNo} onChange={(v) => set("taxAgentRollNo", v)} /></LabeledField>
+          <LabeledField label="MCLE Compliance No."><Field value={c.taxAgentMcle} onChange={(v) => set("taxAgentMcle", v)} /></LabeledField>
+        </div>
+      </div>
+
       <div className="company-save-bar">
         {savePhase === "done" && <span className="save-confirm"><Check size={14} /> Saved</span>}
         {dirty && savePhase === "idle" && <span className="save-pending-note">Unsaved changes</span>}
@@ -2783,6 +2965,8 @@ function CoaPage({ data, setData }) {
     { key: "type", label: "Class", type: "select", options: COA_TYPES, width: 130 },
     { key: "category", label: "Subclass", type: "combo", options: COA_SUBCLASSES, width: 170 },
     { key: "accountType", label: "Account Type", type: "combo", options: COA_ACCOUNT_TYPES, width: 170 },
+    { key: "itrLine", label: "ITR Deduction Line (expenses)", type: "select", options: ITR_LINE_OPTIONS, width: 240 },
+    { key: "finalTax", label: "Subject to Final Tax (income)", type: "select", options: ["Yes"], width: 130 },
     { key: "notes", label: "Notes", width: 220 },
   ];
   const onChange = (id, key, v) => setData((d) => ({ ...d, coa: d.coa.map((r) => r.id === id ? { ...r, [key]: v } : r) }));
@@ -2792,7 +2976,7 @@ function CoaPage({ data, setData }) {
   const onDelete = (id) => setData((d) => ({ ...d, coa: d.coa.filter((r) => r.id !== id) }));
   return (
     <div>
-      <SectionHeader icon={BookOpenText} title="Chart of Accounts" subtitle="Account codes and names referenced across every journal. Add rows as needed." />
+      <SectionHeader icon={BookOpenText} title="Chart of Accounts" subtitle="Account codes and names referenced across every journal. Add rows as needed. ITR Deduction Line maps each expense account to the 1701 Schedule 4 / 1702-RT Schedule I line (Non-deductible = excluded from itemized deductions); Subject to Final Tax keeps an income account out of the income tax returns." />
       <MasterTable title="Chart of Accounts" columns={cols} rows={data.coa} data={data} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
         addLabel="Add account" initialValues={{ type: "Expense" }} />
     </div>
@@ -2811,6 +2995,7 @@ function CustomersPage({ data, setData }) {
     { key: "surname", label: "Surname", width: 120 },
     { key: "address", label: "Address", width: 200 },
     { key: "type", label: "Type", type: "select", options: PARTY_TYPES, width: 130 },
+    { key: "government", label: "Government", type: "select", options: ["No", "Yes"], width: 110 },
     { key: "account", label: "Account", width: 110 },
     { key: "taxCode", label: "Tax Code", type: "percent", align: "right", width: 90 },
   ];
@@ -2823,7 +3008,7 @@ function CustomersPage({ data, setData }) {
     <div>
       <SectionHeader icon={Users} title="Customers Master" subtitle="Add every customer once. The Sales Journal looks up TIN and Address automatically by name." />
       <MasterTable title="Customers Master" columns={cols} rows={data.customers} data={data} onChange={onChange} onCreate={onCreate} onBulkAdd={onBulkAdd} onDelete={onDelete}
-        addLabel="Add customer" initialValues={{ type: "Non-Individual", account: "SALES", taxCode: 0.12 }} />
+        addLabel="Add customer" initialValues={{ type: "Non-Individual", account: "SALES", taxCode: 0.12, government: "No" }} />
     </div>
   );
 }
@@ -2845,6 +3030,7 @@ function SuppliersPage({ data, setData }) {
     { key: "type", label: "Type", type: "select", options: PARTY_TYPES, width: 130 },
     { key: "taxCode", label: "Tax Code", width: 90 },
     { key: "businessStyle", label: "Business Style", width: 140 },
+    { key: "exemptFromWht", label: "Exempt from Withholding", type: "select", options: ["No", "Yes"], width: 150 },
   ];
   const onChange = (id, key, v) => setData((d) => ({ ...d, suppliers: d.suppliers.map((r) => r.id === id ? { ...r, [key]: v } : r) }));
   const sortByName = (arr) => [...arr].sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" }));
@@ -3075,12 +3261,12 @@ function SalesEntryModal({ data, setData, initialRows, onCancel, onSubmit }) {
     setH((p) => ({ ...p, customer: customer.name, tin: customer.tin, address: customer.address }));
     setQuickAdd(null);
   };
-  const computedLines = lines.map((l) => computeSalesRow(l));
+  const computedLines = lines.map((l) => computeSalesRow(l, isVatCompany(data)));
   const totals = computedLines.reduce((a, c) => ({ outputVat: a.outputVat + num(c.outputVat), total: a.total + num(c.total) }), { outputVat: 0, total: 0 });
   const handleSubmit = () => onSubmit(expandEntryLines(lines, initialRows, (l, i, n) => computeSalesRow({
     date: h.date, siNo: lineRef(h.siNo, i, n), customer: h.customer, tin: h.tin, address: h.address, terms: h.terms, bankAccount: h.bankAccount,
     desc: l.desc, vatable: num(l.vatable), exempt: num(l.exempt), zeroRated: num(l.zeroRated), coaCode: l.coaCode,
-  })));
+  }, isVatCompany(data))));
   return (
     <EntryModalShell title={editing ? "Edit Sale" : "Add Sale"} lockDates={[h.date, first && first.date]} submitLabel={entrySubmitLabel(editing, lines.length, "sale")} onCancel={onCancel} onSubmit={handleSubmit}>
       <LabeledField label="Date"><Field type="date" value={h.date} onChange={(x) => setHeader("date", x)} /></LabeledField>
@@ -3737,7 +3923,7 @@ function SalesPage({ data, setData }) {
   const sel = useRowSelection();
 
   const update = (id, patch) => setData((d) => ({
-    ...d, sales: d.sales.map((r) => r.id === id ? computeSalesRow({ ...r, ...patch }) : r),
+    ...d, sales: d.sales.map((r) => r.id === id ? computeSalesRow({ ...r, ...patch }, isVatCompany(d)) : r),
   }));
   const onCustomer = (id, name) => {
     const c = data.customers.find((x) => x.name.toLowerCase() === (name || "").toLowerCase());
@@ -5735,15 +5921,14 @@ function EwtSchedulePage({ data, setData, postings }) {
 
   // Check strip: schedule vs QAP (same source rows) and vs credits posted to 2300 (EWT withheld).
   const check = useMemo(() => {
-    let qap = 0, receiptsCwt = 0;
+    let qap = 0;
     for (let q = 1; q <= 4; q++) {
       [...buildQapRowsFromPurchases(data, q, year), ...buildQapRowsFromDisbursements(data, q, year)].forEach((r) => { qap += num(r.ewt); });
-      buildQapRowsFromReceipts(data, q, year).forEach((r) => { receiptsCwt += num(r.ewt); });
     }
     const start = new Date(year, 0, 1), end = monthEnd(year, 11);
     let gl = 0;
     postings.forEach((p) => { if (p.code === "2300" && inRange(p.date, start, end)) gl += p.credit; });
-    return { qap: round2(qap), receiptsCwt: round2(receiptsCwt), gl: round2(gl) };
+    return { qap: round2(qap), gl: round2(gl) };
   }, [data, postings, year]);
   const schedEwt = round2(sched.total.totalEwt);
   const qapDiff = round2(schedEwt - check.qap), glDiff = round2(schedEwt - check.gl);
@@ -5857,11 +6042,6 @@ function EwtSchedulePage({ data, setData, postings }) {
         {!reconciled && (
           <div className="vs-check-causes">
             Likely causes: manual General Journal credits to 2300; purchases with EWT but no ATC (they post to 2300 but aren't on the QAP or this schedule); or entries dated outside {year}.
-          </div>
-        )}
-        {check.receiptsCwt > 0 && (
-          <div className="vs-check-causes">
-            Note: the QAP page also adds {fmtPlain(check.receiptsCwt)} of Cash Receipts CWT for {year}. That is tax withheld from the company, not by it, so this schedule leaves it out.
           </div>
         )}
       </div>
@@ -7654,16 +7834,16 @@ async function downloadAlphalistDat(record) {
 }
 
 async function build2316Pdf(jsPDFCtor, data, filingDetails, employee, year) {
-  const doc = new jsPDFCtor({ orientation: "portrait", unit: "pt", format: "letter" });
-  const left = 42; const right = 570; let y = 36;
+  const doc = new jsPDFCtor({ orientation: "portrait", unit: "pt", format: "a4" });
+  const left = 40; const right = 555; let y = 36;
   const fullName = [employee.lastName, employee.firstName, employee.middleName].filter(Boolean).join(", ");
   const mwe = employee.isMWE === "Y";
 
   doc.setFont("helvetica", "bold"); doc.setFontSize(11);
-  doc.text("BIR FORM 2316", 306, y, { align: "center" }); y += 13;
+  doc.text("BIR FORM 2316", 297, y, { align: "center" }); y += 13;
   doc.setFontSize(8.5); doc.setFont("helvetica", "normal");
-  doc.text("Certificate of Compensation Payment/Tax Withheld For Compensation Payment With or Without Tax Withheld", 306, y, { align: "center", maxWidth: 480 }); y += 20;
-  doc.setFont("helvetica", "bold"); doc.text(`For the Year ${year}`, 306, y, { align: "center" }); y += 18;
+  doc.text("Certificate of Compensation Payment/Tax Withheld For Compensation Payment With or Without Tax Withheld", 297, y, { align: "center", maxWidth: 480 }); y += 20;
+  doc.setFont("helvetica", "bold"); doc.text(`For the Year ${year}`, 297, y, { align: "center" }); y += 18;
 
   doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.text("Part I — Employee Information", left, y); y += 13;
   doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
@@ -7691,7 +7871,7 @@ async function build2316Pdf(jsPDFCtor, data, filingDetails, employee, year) {
        ["SSS/GSIS/PHIC/HDMF & Union Dues", fmtPlain(employee.pContributions)], ["Salaries (₱250K & below) & Other Forms", fmtPlain(employee.pSalariesNonTax)]];
 
   doc.autoTable({
-    startY: y, margin: { left, right: 612 - right },
+    startY: y, margin: { left, right: 595 - right },
     head: [["Present Employer — Non-Taxable/Exempt Compensation", "Amount"]],
     body: [...nonTaxBody, [{ content: "Total Non-Taxable", styles: { fontStyle: "bold" } }, { content: fmtPlain(employee.pTotalNonTax), styles: { fontStyle: "bold" } }]],
     styles: { font: "helvetica", fontSize: 8, cellPadding: 4 },
@@ -7701,7 +7881,7 @@ async function build2316Pdf(jsPDFCtor, data, filingDetails, employee, year) {
   y = doc.lastAutoTable.finalY + 10;
 
   doc.autoTable({
-    startY: y, margin: { left, right: 612 - right },
+    startY: y, margin: { left, right: 595 - right },
     head: [["Present Employer — Taxable Compensation", "Amount"]],
     body: [
       ["Basic Salary (net of contributions)", fmtPlain(employee.pBasicSalary)],
@@ -7718,7 +7898,7 @@ async function build2316Pdf(jsPDFCtor, data, filingDetails, employee, year) {
 
   if (y > 620) { doc.addPage(); y = 40; }
   doc.autoTable({
-    startY: y, margin: { left, right: 612 - right },
+    startY: y, margin: { left, right: 595 - right },
     head: [["Part III — Tax Summary (Present + Previous Employer)", "Amount"]],
     body: [
       ["Total Taxable Compensation Income", fmtPlain(employee.totalTaxableComp)],
@@ -8266,10 +8446,23 @@ function EmployeeEntryModal({ data, initial, onCancel, onSubmit }) {
   const set = (k, val) => setV((p) => ({ ...p, [k]: val }));
   const computed = computeEmployeeRow(v);
   const isEdit = !!initial;
+  const records = data.employeeRecords || [];
+  const recOptions = records.map((e) => ({ value: e.id, label: `${employeeDisplayName(e)}${e.tin ? " · " + e.tin : ""}${e.empNo ? " · #" + e.empNo : ""}` }));
+  const linked = v.employeeId ? records.find((e) => e.id === v.employeeId) : null;
+  const pickRecord = (id) => {
+    const rec = records.find((e) => e.id === id);
+    if (!rec) { set("employeeId", ""); return; }
+    setV((p) => alphalistFieldsFromRecord(rec, p));
+  };
   return (
     <EntryModalShell title={isEdit ? "Edit Employee" : "Add Employee"} submitLabel={isEdit ? "Save changes" : "Add employee"} onCancel={onCancel}
       onSubmit={() => onSubmit(computeEmployeeRow({ id: v.id || uid(), ...v }))}>
-      <div className="sub-block-title" style={{ marginTop: 0 }}>Identity</div>
+      <div className="sub-block-title" style={{ marginTop: 0 }}>Employees Record</div>
+      <LabeledField label="Pick from Employees Record" wide>
+        <Field type="combo" options={recOptions} value={v.employeeId || ""} onChange={pickRecord} placeholder={records.length ? "Search name, TIN or employee no." : "No Employees Record entries yet (Setup → Employees Record)"} />
+      </LabeledField>
+      {linked && <p className="section-head-note" style={{ margin: "0 0 8px" }}>Linked to {employeeDisplayName(linked)}. Name, TIN, address, MWE flag, employment dates, substituted filing and previous employer are read live from the record; edit them there.</p>}
+      <div className="sub-block-title">Identity</div>
       <LabeledField label="Year"><Field type="select" options={getAvailableYears(data)} value={v.year} onChange={(x) => set("year", Number(x))} /></LabeledField>
       <LabeledField label="TIN"><Field value={v.tin} onChange={(x) => set("tin", x)} placeholder="000-000-000-000" /></LabeledField>
       <LabeledField label="Last Name"><Field value={v.lastName} onChange={(x) => set("lastName", x)} /></LabeledField>
@@ -8354,7 +8547,12 @@ function AlphalistEmployeesPage({ data, setData }) {
     setConfirmDeleteOpen(false);
   };
 
-  const allRows = useMemo(() => (data.employees || []).map(computeEmployeeRow), [data.employees]);
+  const recById = useMemo(() => new Map((data.employeeRecords || []).map((e) => [e.id, e])), [data.employeeRecords]);
+  // Rows linked to an Employees Record entry read their identity fields live from it.
+  const allRows = useMemo(() => (data.employees || []).map((r) => {
+    const rec = r.employeeId ? recById.get(r.employeeId) : null;
+    return computeEmployeeRow(rec ? alphalistFieldsFromRecord(rec, r) : r);
+  }), [data.employees, recById]);
   const filteredRows = useMemo(() => allRows.filter((r) => Number(r.year) === year && matchesSearch(r, ["tin","lastName","firstName","middleName"], search)), [allRows, year, search]);
   const sched1Rows = useMemo(() => filteredRows.filter((r) => r.isMWE !== "Y"), [filteredRows]);
   const sched2Rows = useMemo(() => filteredRows.filter((r) => r.isMWE === "Y"), [filteredRows]);
@@ -8367,6 +8565,12 @@ function AlphalistEmployeesPage({ data, setData }) {
     const rows = scheduleNo === 2 ? sched2Rows : sched1Rows;
     if (rows.length === 0) return;
     downloadAlphalistDat(buildAlphalistDatRecord(filingDetails, rows, year, scheduleNo));
+  };
+  const onSchedulePdf = async (scheduleNo) => {
+    setGenStatus({ type: "pending", text: "Generating PDF…" });
+    try { await downloadEmployeeAlphalistPdf(data, scheduleNo === 2 ? sched2Rows : sched1Rows, year, scheduleNo); setGenStatus({ type: "success", text: "PDF downloaded (A4 landscape)." }); }
+    catch (e) { setGenStatus({ type: "error", text: "Couldn't generate the PDF — check your connection and try again." }); }
+    setTimeout(() => setGenStatus(null), 5000);
   };
   const onDownloadAll2316 = async () => {
     setGenStatus({ type: "pending", text: "Generating certificates…" });
@@ -8455,6 +8659,8 @@ function AlphalistEmployeesPage({ data, setData }) {
             <div className="header-actions">
               <button className="io-btn" onClick={() => onDownloadDat(1)} disabled={sched1Rows.length === 0}><FileDown size={13} /> Schedule 1 .dat ({sched1Rows.length} regular)</button>
               <button className="io-btn" onClick={() => onDownloadDat(2)} disabled={sched2Rows.length === 0}><FileDown size={13} /> Schedule 2 .dat ({sched2Rows.length} MWE)</button>
+              <button className="io-btn" onClick={() => onSchedulePdf(1)} disabled={sched1Rows.length === 0}><FileDown size={13} /> Schedule 1 PDF (A4 landscape)</button>
+              <button className="io-btn" onClick={() => onSchedulePdf(2)} disabled={sched2Rows.length === 0}><FileDown size={13} /> Schedule 2 PDF (A4 landscape)</button>
               <button className="io-btn" onClick={onDownloadAll2316}><FileDown size={13} /> Download all 2316 certificates (.zip)</button>
             </div>
           </div></div>
@@ -8944,6 +9150,8 @@ function buildQapRowsFromEwtSource(data, quarter, year, source) {
 }
 const buildQapRowsFromPurchases = (data, quarter, year) => buildQapRowsFromEwtSource(data, quarter, year, "purchases");
 const buildQapRowsFromDisbursements = (data, quarter, year) => buildQapRowsFromEwtSource(data, quarter, year, "disbursements");
+// All QAP rows for a quarter (purchases + disbursements), the same rows the EWT Schedule totals.
+const buildQapRows = (data, quarter, year) => [...buildQapRowsFromPurchases(data, quarter, year), ...buildQapRowsFromDisbursements(data, quarter, year)];
 
 // Cash Receipts entries with an ATC and a resulting CWT feed QAP too — the party here is looked
 // up in Customers Master (not Suppliers), since "Received From" ties to a customer/payor.
@@ -9112,7 +9320,9 @@ function QAPPage({ data }) {
   const [year, setYear] = useState(2026);
 
   const allRows = useMemo(() => {
-    const rows = [...buildQapRowsFromPurchases(data, quarter, year), ...buildQapRowsFromDisbursements(data, quarter, year), ...buildQapRowsFromReceipts(data, quarter, year)];
+    // EWT withheld BY the company only. Cash Receipts CWT is tax withheld FROM the company (it belongs
+    // in the SAWT), so it is not part of the QAP / 1601-EQ.
+    const rows = buildQapRows(data, quarter, year);
     rows.sort((a, b) => (a.sortKey || "").localeCompare(b.sortKey || "") || a.monthInfo.month - b.monthInfo.month);
     return rows;
   }, [data, quarter, year]);
@@ -9136,7 +9346,7 @@ function QAPPage({ data }) {
 
   return (
     <div>
-      <SectionHeader icon={FileText} title="QAP" subtitle="Quarterly Alphalist of Payees (BIR Form 1601-EQ attachment) — auto-sourced from ATC-tagged Purchase Journal, Cash Disbursements, and Cash Receipts entries." />
+      <SectionHeader icon={FileText} title="QAP" subtitle="Quarterly Alphalist of Payees (BIR Form 1601-EQ attachment) — auto-sourced from ATC-tagged Purchase Journal and Cash Disbursements entries. Cash Receipts CWT (tax withheld from the company) goes to the SAWT, not here." />
       <ReliefCompanyWarning filingDetails={filingDetails} needAddr={false} />
       <div className="form-card">
         <div className="form-grid">
@@ -9145,7 +9355,7 @@ function QAPPage({ data }) {
         </div>
       </div>
       {allRows.length === 0 ? (
-        <div className="empty-panel">No ATC-tagged transactions found for {QUARTERS[quarter - 1].label}, {year}. Set an ATC code on the relevant rows in the Purchase Journal, Cash Disbursements, or Cash Receipts (with a resulting EWT/CWT) to have them appear here.</div>
+        <div className="empty-panel">No ATC-tagged transactions found for {QUARTERS[quarter - 1].label}, {year}. Set an ATC code on the relevant rows in the Purchase Journal or Cash Disbursements (with a resulting EWT) to have them appear here.</div>
       ) : (
         <>
           <div className="ledger-wrap">
@@ -9199,7 +9409,7 @@ function QAPPage({ data }) {
           <ExportStatus status={reportExport.status} />
         </>
       )}
-      <div className="rc-warn">Rows are pulled from the Purchase Journal, Cash Disbursements, and Cash Receipts for the selected quarter — any transaction with an ATC code (and a resulting EWT/CWT greater than zero) feeds QAP automatically, grouped by the transaction's actual month within the quarter. Text fields are quoted only when non-blank; per-row branch codes default to 0000 unless set on the Supplier/Customer. Always run each file through the BIR Alphalist Validation Module before submitting.</div>
+      <div className="rc-warn">Rows are pulled from the Purchase Journal and Cash Disbursements for the selected quarter — any transaction with an ATC code (and a resulting EWT greater than zero) feeds QAP automatically, grouped by the transaction's actual month within the quarter. Text fields are quoted only when non-blank; per-row branch codes default to 0000 unless set on the Supplier/Customer. Always run each file through the BIR Alphalist Validation Module before submitting.</div>
     </div>
   );
 }
@@ -9711,3 +9921,18 @@ function Style() {
     `}</style>
   );
 }
+
+/* ============================== SHARED WITH src/tax/* ============================== */
+// The BIR return tabs live in src/tax/. They import these helpers so their figures come from the
+// same aggregators as the schedules (no second set of loops over the journals).
+export {
+  fmt, fmtPlain, fmtParen, fmtAcct, num, round2, MONTHS, QUARTERS, getAvailableYears, pad2, uid, todayMDY, todayFileStamp,
+  parseAppDate, toMDY, monthEnd, inRange, BANK_ACCOUNTS, NumberField, SectionHeader, ReadCell, ConfirmModal,
+  AddRowBtn, DelBtn, SearchBar, matchesSearch, useRowSelection, SelectAllCheckbox, RowCheckbox, SelectionBar,
+  usePagination, PageSizeSelect, PaginationBar, ImportExportBar, ImportStatus, useJournalImport, ExportBar, ExportStatus,
+  useJournalExport, useReportExport, loadJsPDF, withTimeout, buildFilingDetails, reliefFormatTIN, reliefPadBranch,
+  normalizeTin, renderAlphalistSchedulePdf, computeEwtSchedule, ewtSourceRows, buildQapRows, computeVatSchedule,
+  aggregateVatByYear, purchaseSlspiField, computeIncomeStatement, computeEmployeeRow, EMP_STATUS_OPTIONS,
+  SEP_REASON_OPTIONS, isVatCompany, ITR_LINES, ITR_NON_DEDUCTIBLE, atcKey, EWT_GROUPS, ComputedPreview, useOverlayClose,
+  computeAssetRow,
+};
